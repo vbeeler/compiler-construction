@@ -1,0 +1,151 @@
+#lang typed/racket
+
+(provide (all-defined-out))
+
+;; DEFINITIONS/TYPES
+
+;; ABSTRACT SYNTAX TREE (AST)
+
+(struct Program ([types : (Listof Struct)] [declarations : (Listof Declaration)] [functions : (Listof Function)]) #:transparent)
+(struct Declaration ([type : Type] [id : Symbol]) #:transparent)
+(define-type Type (U 'int 'bool Symbol))
+(struct Struct ([id : Symbol] [fields : (Listof Declaration)]) #:transparent)
+(struct Function ([id : Symbol] [parameters : (Listof Declaration)] [return-type : Return-Type] [declarations : (Listof Declaration)] [statements : (Listof Statement)]) #:transparent)
+(define-type Return-Type (U Type 'void))
+(define-type Statement (U Block-Expr Assignment Print Conditional Loop Delete Ret Invocation))
+(struct Block-Expr ([statements : (Listof Statement)]) #:transparent)
+(struct Assignment ([target : Lvalue] [source : Expression]) #:transparent)
+(define-type Lvalue (U Selector Factor))
+(define-type Expression (U Binary Unary Selector Factor))
+(define-type Expression-Type (U Type 'null))
+(struct Binary ([operator : BinOp] [left : Expression] [right : Expression]) #:transparent)
+(define-type BinOp (U '|| '&& '== '!= '< '> '<= '>= '+ '- '* '/))
+(struct Unary ([operator : UnOp] [operand : Expression]) #:transparent)
+(define-type UnOp (U '! '-))
+(struct Selector ([left : Expression] [id : Symbol]) #:transparent)
+(define-type Factor (U Symbol Invocation Integer Boolean Allocation 'null))
+(struct Invocation ([id : Symbol] [arguments : (Listof Expression)]) #:transparent)
+(struct Allocation ([id : Symbol]) #:transparent)
+(struct Print ([expression : Expression] [endl : Boolean]) #:transparent)
+(define-type Conditional (U If If-Else))
+(struct If ([guard : Expression] [then : Block-Expr]) #:transparent)
+(struct If-Else ([guard : Expression] [then : Block-Expr] [else : Block-Expr]) #:transparent)
+(struct Loop ([guard : Expression] [body : Block-Expr]) #:transparent)
+(struct Delete ([expression : Expression]) #:transparent)
+(define-type Ret (U Return Return-Void))
+(struct Return ([expression : Expression]) #:transparent)
+(struct Return-Void [] #:transparent)
+
+;; TYPE ENVIRONMENT
+
+(define-type Variable-Type-Env (Listof Type-Binding))
+(struct Type-Binding ([name : Symbol] [type : Type]) #:transparent)
+
+(define-type Struct-Type-Env (Listof Struct-Binding))
+(struct Struct-Binding ([name : Symbol] [fields : Variable-Type-Env]) #:transparent)
+
+(define-type Function-Type-Env (Listof Function-Binding))
+(struct Function-Binding ([name : Symbol] [args : (Listof Type)] [return-type : Return-Type] [locals : Variable-Type-Env]) #:transparent #:mutable)
+
+(struct Environment ([structs : Struct-Type-Env]
+                     [globals : Variable-Type-Env]
+                     [functions : Function-Type-Env])
+  #:transparent #:mutable)
+
+;; base local variable environment
+(define base-local-env
+  (list
+   (Type-Binding 'read 'int)))
+
+;; base function environment - function bindings for binary functions
+(define base-function-env
+  (list
+   (Function-Binding '+ (list 'int 'int) 'int base-local-env)
+   (Function-Binding '- (list 'int 'int) 'int base-local-env)
+   (Function-Binding '* (list 'int 'int) 'int base-local-env)
+   (Function-Binding '/ (list 'int 'int) 'int base-local-env)
+   (Function-Binding '< (list 'int 'int) 'bool base-local-env)
+   (Function-Binding '> (list 'int 'int) 'bool base-local-env)
+   (Function-Binding '<= (list 'int 'int) 'bool base-local-env)
+   (Function-Binding '>= (list 'int 'int) 'bool base-local-env)
+   (Function-Binding '|| (list 'bool 'bool) 'bool base-local-env)
+   (Function-Binding '&& (list 'bool 'bool) 'bool base-local-env)))
+
+;; Control Flow Graph (CFG)
+
+(struct CFG ([func-name : Symbol] [parameters : (Listof Declaration)] [return-type : Return-Type] [blocks : Block-Table]) #:transparent) 
+(struct Block ([label : Integer]
+               [LLVM : (Listof LLVM-Instr)]
+               [definitions : (Listof LLVM-Definition)]
+               [predecessors : (Listof Block)]
+               [successors : (Listof Block)]
+               [reachable : Boolean]
+               [sealed : Boolean])
+  #:transparent #:mutable)
+(define-type Block-Label (U Integer 'exit-block))
+(define-type Block-Table (Mutable-HashTable Block-Label Block))
+
+;; LLVM Instructions
+
+(define-type LLVM-Instr (U Alloca-Instr Arith-Instr Bool-Instr Comp-Instr Size-Instr Get-Elm-Ptr-Instr
+                           Call-Instr Malloc-Instr Free-Instr Load-Instr Store-Instr Print-Instr Scan-Instr
+                           Branch-Instr Cond-Branch-Instr Return-Expr-Instr Return-Void-Instr Phi-Instr))
+(struct Alloca-Instr ([type : Type] [target : Target]) #:transparent)
+(struct Arith-Instr ([operator : Arith-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Bool-Instr ([operator : Bool-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Comp-Instr ([operator : Comp-Operator] [type : Type] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Size-Instr ([operator : Size-Operator] [operand : Operand] [from-type : String] [to-type : String] [target : Target]) #:transparent)
+(struct Get-Elm-Ptr-Instr ([type : Symbol] [pointer : Operand] [field-offset : Integer] [target : Target]) #:transparent)
+(struct Call-Instr ([func-name : Operand] [return-type : Type] [arg-types : (Listof Type)] [args : (Listof Operand)] [target : Target]) #:transparent)
+(struct Malloc-Instr ([target : Target]) #:transparent)
+(struct Free-Instr ([target : Target]) #:transparent)
+(struct Load-Instr ([type : Type] [source : Operand] [target : Target] [indirection : Integer]) #:transparent)
+(struct Store-Instr ([type : Type] [source : Operand] [target : Operand] [indirection : Integer]) #:transparent)
+(struct Print-Instr ([operand : Operand] [endl : Boolean] [target : Target]) #:transparent)
+(struct Scan-Instr ([var : Operand] [result : Target]) #:transparent)
+(define-type Branch (U Branch-Instr Cond-Branch-Instr))
+(struct Branch-Instr ([block : Block]) #:transparent)
+(struct Cond-Branch-Instr ([cond : Operand] [true : Block] [false : Block]) #:transparent)
+(struct Return-Expr-Instr ([type : Type] [expr : Operand]) #:transparent)
+(struct Return-Void-Instr [] #:transparent)
+(struct Phi-Instr ([block : Block] [var : Symbol]) #:transparent)
+
+;; LLVM operators
+(define-type Operator (U Arith-Operator Bool-Operator Comp-Operator Size-Operator))
+(define-type Arith-Operator (U '+ '- '* '/))
+(define-type Bool-Operator (U '|| '&& '^^))
+(define-type Comp-Operator (U '== '!= '< '> '<= '>=))
+(define-type Size-Operator (U 'trunc 'zext 'bitcast))
+
+;; LLVM useful types
+(struct Expr-LLVM ([LLVM : (Listof LLVM-Instr)] [result : Intermediate]) #:transparent)
+(define-type Literal (U Integer Boolean 'null))
+(struct Local ([id : Symbol]) #:transparent)
+(struct Global ([id : Symbol]) #:transparent)
+(struct Intermediate ([num : Integer]) #:transparent)
+(struct Register ([num : Integer]) #:transparent)
+(define-type Operand (U Literal Local Global Intermediate Register Block))
+(define-type Target (U Local Global Intermediate Register))
+(define-type Definition-Value (U Register Literal))
+(struct C-Lib-Funcs ([malloc : Boolean]
+                     [free : Boolean]
+                     [printf-newline : Boolean]
+                     [printf-space : Boolean]
+                     [scanf : Boolean])
+  #:transparent #:mutable)
+(struct Field ([type : Type] [offset : Integer]) #:transparent)
+(struct Levels-Indirection ([primitive : Integer] [struct : Integer]) #:transparent)
+(struct LLVM-Declaration ([type : Type] [operand : Operand]) #:transparent)
+(struct LLVM-Definition ([var : Symbol] [value : Definition-Value]) #:transparent #:mutable)
+
+;; LLVM Program
+(struct Struct-Instr ([name : Symbol] [fields : (Listof Type)]) #:transparent)
+(struct Global-Instr ([name : Symbol] [type : Type]) #:transparent)
+(struct LLVM-Program ([structs : (Listof Struct-Instr)]
+                      [globals : (Listof Global-Instr)]
+                      [func-CFGs : (Listof CFG)]
+                      [c-lib-funcs : C-Lib-Funcs])
+  #:transparent)
+
+;; Compiler Specifications
+(define-type Compiler-Mode (U 'stack 'registers))
