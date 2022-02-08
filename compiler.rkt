@@ -124,44 +124,36 @@
 (define (type-check-program [program : Program]) : Environment
   (match program
     [(Program types declarations functions)
-     (define structs (bind-structs types '()))
-     (define global-variables (bind-declarations declarations (map Struct-Binding-name structs)))
-     (define environment (type-check-functions functions (Environment structs global-variables '())))
-     (check-func-names-unique (map Function-Binding-name (Environment-functions environment)))
+     (define environment (Environment (ann (make-hash '()) Struct-Environment)
+                                      (ann (make-hash '()) Variable-Environment)
+                                      (base-function-env)))
+     (bind-structs! types (Environment-structs environment))
+     (bind-declarations! declarations (Environment-structs environment) (Environment-globals environment))
+     (map (lambda ([function : Function]) (type-check-function function environment)) functions)
      (check-valid-main (Environment-functions environment))
      environment]))
 
-;; checks for redeclarations of function names
-(define (check-func-names-unique [ids : (Listof Symbol)]) : Void
-  (cond [(not (empty? ids))
-         (cond [(first-id-unique? (first ids) (rest ids))
-                (check-func-names-unique (rest ids))]
-               [else (error 'check-func-names-unique "Redeclaration of function with identifier ~e is not allowed" (first ids))])]))
-
 ;; checks for a valid main function
-(define (check-valid-main [functions : Function-Type-Env]) : Void
-  (if (empty? functions)
-      (error 'check-valid-main "No main function defined; every valid program must have a function named 'main that takes no arguments and returns an 'int")
-      (cond [(equal? (Function-Binding-name (first functions)) 'main)
-             (cond [(not (and (equal? (Function-Binding-args (first functions)) '())
-                              (equal? (Function-Binding-return-type (first functions)) 'int)))
-                    (error 'check-valid-main "'main has an invalid signature, expected '() -> 'int, given ~e -> ~e"
-                           (Function-Binding-args (first functions)) (Function-Binding-return-type (first functions)))])]
-             [else (check-valid-main (rest functions))])))
+(define (check-valid-main [functions : Function-Environment]) : Void
+  (if (hash-has-key? functions 'main)
+      (let ([main-function : Function-Type (hash-ref functions 'main)])
+        (cond [(not (and (equal? (Function-Type-args main-function) '())
+                         (equal? (Function-Type-return-type main-function) 'int)))
+               (error 'check-valid-main "'main has an invalid signature, expected '() -> 'int, given ~e -> ~e"
+                      (Function-Type-args main-function) (Function-Type-return-type main-function))]))
+      (error 'check-valid-main "No main function defined; every valid program must have a function named 'main that takes no arguments and returns an 'int")))
 
 ;; type checks the program's functions
-(define (type-check-functions [functions : (Listof Function)] [env : Environment]) : Environment
-  (cond
-    [(empty? functions) env]
-    [else (let ([first-function-binding : Function-Binding (bind-function (first functions) (Environment-structs env))])
-            (set-Environment-functions! env (cons first-function-binding (Environment-functions env)))
-            (type-check-function (first functions) env)
-            (cond [(not (equal? (Function-return-type (first functions)) 'void))
-                   (cond [(not (all-paths-return? (Function-statements (first functions))))
-                          (error 'type-check-functions "All paths through function ~e must return with type ~e"
-                                 (Function-id (first functions)) (Function-return-type (first functions)))])])
-            (type-check-functions (rest functions) env)
-            env)]))
+(define (type-check-function [function : Function] [env : Environment]) : Void
+  (define function-type (bind-function function (Environment-structs env)))
+  (if (hash-has-key? (Environment-functions env) (Function-id function))
+      (error 'type-check-function "Redeclaration of function ~e is not allowed." (Function-id function))
+      (hash-set! (Environment-functions env) (Function-id function) function-type))
+  (type-check-statements (Function-statements function) env (Function-return-type function) function-type)
+  (cond [(and (not (equal? (Function-return-type function) 'void))
+              (not (all-paths-return? (Function-statements function))))
+         (error 'type-check-function "All paths through function ~e must return with type ~e"
+                (Function-id function) (Function-return-type function))]))
 
 ;; do all paths through the function return a value? assumes the function has a non-void return type
 (define (all-paths-return? [statements : (Listof Statement)]) : Boolean
@@ -183,99 +175,91 @@
         [(Invocation id arguments) (all-paths-return? (rest statements))])))
     
 ;; binds a function name to a list of argument types and a return type
-(define (bind-function [function : Function] [structs : Struct-Type-Env]) : Function-Binding
+(define (bind-function [function : Function] [structs : Struct-Environment]) : Function-Type
   (match function
     [(Function name parameters return-type declarations statements)
-     (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'bind-function "Function ~e's parameters failed type check : ~e"
+     (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'bind-function "Function ~e's parameters/locals failed type check : ~e"
                                                              name (exn-message exn)))])
-       (Function-Binding name (map Type-Binding-type (bind-declarations parameters (map Struct-Binding-name structs))) return-type '()))]))
-
-;; type checks a single function 
-(define (type-check-function [function : Function] [env : Environment]) : Void
-  (match function
-    [(Function name parameters return-type declarations statements)
-     (let ([local-env : Variable-Type-Env (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-function "Function ~e's local variables failed type check : ~e"
-                                                                                                  name (exn-message exn)))])
-                                            (bind-declarations (append declarations parameters) (map Struct-Binding-name (Environment-structs env))))])
-       (let ([cur-func-binding : Function-Binding (first (Environment-functions env))])
-         (set-Function-Binding-locals! cur-func-binding (append base-local-env local-env))
-         (type-check-statements statements env return-type)))]))
+       (define locals (base-local-env))
+       (bind-declarations! (append parameters declarations) structs locals)
+       (Function-Type (map Declaration-type parameters) return-type locals))]))
 
 ;; type checks a list of statements
-(define (type-check-statements [statements : (Listof Statement)] [environment : Environment] [expected-return-type : Return-Type]) : Void
+(define (type-check-statements [statements : (Listof Statement)] [env : Environment] [expected-return-type : Return-Type] [func-type : Function-Type]) : Void
   (cond [(not (empty? statements))
-         (type-check-statement (first statements) environment expected-return-type)
-         (type-check-statements (rest statements) environment expected-return-type)]))
+         (type-check-statement (first statements) env expected-return-type func-type)
+         (type-check-statements (rest statements) env expected-return-type func-type)]))
 
 ;; type checks a single statement
-(define (type-check-statement [statement : Statement] [environment : Environment] [expected-return-type : Return-Type]) : Void
-  (match statement
+(define (type-check-statement [statement : Statement] [env : Environment] [expected-return-type : Return-Type] [func-type : Function-Type]) : Void
+  (match statement 
     [(Block-Expr statements)
-     (type-check-statements statements environment expected-return-type)]
+     (type-check-statements statements env expected-return-type func-type)]
     [(Assignment target source)
-     (let ([source-type : Type (type-check-expression source environment)]
-           [target-type : Type (type-check-expression target environment)])
+     (let ([source-type : Type (type-check-expression source env func-type)]
+           [target-type : Type (type-check-expression target env func-type)])
        (cond [(not (or (equal? source-type target-type)
                        (and (equal? source-type 'null) (structure-type? target-type))))
               (error 'type-check-statement "Assignment ~e = ~e failed type checking: cannot assign type ~e to a variable of type ~e"
                      target source source-type target-type)]))]
     [(Print expression endl) 
-     (let ([expression-type : Type (type-check-expression expression environment)])
+     (let ([expression-type : Type (type-check-expression expression env func-type)])
        (cond [(not (equal? expression-type 'int))
               (error 'type-check-statement "Print requires an integer argument; given type ~e" expression-type)]))]
     [(If guard then-block)
-     (let ([guard-type : Type (type-check-expression guard environment)])
+     (let ([guard-type : Type (type-check-expression guard env func-type)])
        (cond [(not (equal? guard-type 'bool))
               (error 'type-check-statement "If statements require boolean guards; given expression ~e of type ~e" guard guard-type)])
-       (type-check-statements (Block-Expr-statements then-block) environment expected-return-type))]
+       (type-check-statements (Block-Expr-statements then-block) env expected-return-type func-type))]
     [(If-Else guard then-block else-block)
-     (let ([guard-type : Type (type-check-expression guard environment)])
+     (let ([guard-type : Type (type-check-expression guard env func-type)])
        (cond [(not (equal? guard-type 'bool))
               (error 'type-check-statement "If statements require boolean guards; given expression ~e of type ~e" guard guard-type)])
-       (type-check-statements (Block-Expr-statements then-block) environment expected-return-type)
-       (type-check-statements (Block-Expr-statements else-block) environment expected-return-type))]
+       (type-check-statements (Block-Expr-statements then-block) env expected-return-type func-type)
+       (type-check-statements (Block-Expr-statements else-block) env expected-return-type func-type))]
     [(Loop guard body)
-     (let ([guard-type : Type (type-check-expression guard environment)])
+     (let ([guard-type : Type (type-check-expression guard env func-type)])
        (cond [(not (equal? guard-type 'bool))
               (error 'type-check-statement "While loops require boolean guards; given expression ~e of type ~e" guard guard-type)])
-       (type-check-statements (Block-Expr-statements body) environment expected-return-type))]
+       (type-check-statements (Block-Expr-statements body) env expected-return-type func-type))]
     [(Delete expression)
-     (let ([expression-type : Type (type-check-expression expression environment)])
+     (let ([expression-type : Type (type-check-expression expression env func-type)])
        (cond [(not (structure-type? expression-type))
               (error 'type-check-statement "Delete requires a structure type; given expression ~e of type ~e" expression expression-type)]))]
     [(Return expression) 
-     (let ([actual-return-type : Type (type-check-expression expression environment)])
+     (let ([actual-return-type : Type (type-check-expression expression env func-type)])
        (cond [(not (equal? actual-return-type expected-return-type))
               (error 'type-check-statement "Return expression ~e failed type check; given type ~e, expected type ~e"
                      expression actual-return-type expected-return-type)]))]
     [(Return-Void) (cond [(not (equal? expected-return-type 'void))
                           (error 'type-check-statement "Return statement failed type check; given type 'void, expected type ~e" expected-return-type)])]
     [(Invocation id arguments)
-     (let ([function-binding : Function-Binding (lookup-function id (Environment-functions environment))]
-           [actual-arg-types : (Listof Expression-Type) (map (lambda ([arg : Expression]) (type-check-expression arg environment)) arguments)])
-       (cond [(not (valid-arguments? (Function-Binding-args function-binding) actual-arg-types))
+     (let ([function-type : Function-Type (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-statement "Function ~e is not defined: ~e" id))])
+                                               (hash-ref (Environment-functions env) id))]
+           [actual-arg-types : (Listof Expression-Type) (map (lambda ([arg : Expression]) (type-check-expression arg env func-type)) arguments)])
+       (cond [(not (valid-arguments? (Function-Type-args function-type) actual-arg-types))
               (error 'type-check-statement "Invocation of function ~e failed type check; given expressions ~e of types ~e, expected types ~e"
-                     id arguments actual-arg-types (Function-Binding-args function-binding))]))]))
+                     id arguments actual-arg-types (Function-Type-args function-type))]))]))
 
 ;; type checks an expression
-(define (type-check-expression [expression : Expression] [env : Environment]) : Expression-Type
+(define (type-check-expression [expression : Expression] [env : Environment] [func-type : Function-Type]) : Expression-Type
   (match expression
     [(Binary operator left right)
-     (let ([left-type : Type (type-check-expression left env)]
-           [right-type : Type (type-check-expression right env)])
+     (let ([left-type : Type (type-check-expression left env func-type)]
+           [right-type : Type (type-check-expression right env func-type)])
        (cond
          [(or (equal? operator '==) (equal? operator '!=))
           (if (and (equal? left-type right-type) (not (equal? left-type 'bool)))
               'bool
               (error 'type-check-expression "Equality operator ~e requires operands of matching types (either 'int or structure); given expressions ~e of type ~e and ~e of type ~e"
                      operator left left-type right right-type))]
-         [else (let ([function-binding : Function-Binding (lookup-function operator base-function-env)])
-                 (cond [(equal? (list left-type right-type) (Function-Binding-args function-binding))
-                        (Function-Binding-return-type function-binding)]
+         [else (let ([function-type : Function-Type (hash-ref (Environment-functions env) operator)])
+                 (cond [(equal? (list left-type right-type) (Function-Type-args function-type))
+                        (Function-Type-return-type function-type)]
                        [else (error 'type-check-expression "Binary operator ~e requires operands of types ~e; given expressions ~e of type ~e and ~e of type ~e"
-                                    operator (Function-Binding-args function-binding) left left-type right right-type)]))]))]
+                                    operator (Function-Type-args function-type) left left-type right right-type)]))]))]
     [(Unary operator operand)
-     (let ([operand-type : Type (type-check-expression operand env)])
+     (let ([operand-type : Type (type-check-expression operand env func-type)])
        (cond
          [(equal? operator '!)
           (if (equal? operand-type 'bool)
@@ -288,124 +272,70 @@
               (error 'type-check-expression "Unary operator '- requires one operand of type 'int; given expression ~e of type ~e"
                      operand operand-type))]))]
     [(Selector left symbol) 
-     (let ([left-type : Type (type-check-expression left env)])
+     (let ([left-type : Type (type-check-expression left env func-type)])
        (if (structure-type? left-type)
-           (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Structure ~e field access failed: ~e"
-                                                                   left-type (exn-message exn)))])
-             (let ([fields : Variable-Type-Env (lookup-struct left-type (Environment-structs env))])
-               (lookup-id symbol fields)))
+           (let ([fields : Field-Environment (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Structure type ~e is not defined." left-type))])
+                                               (Struct-Type-fields (hash-ref (Environment-structs env) left-type)))])
+             (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Structure ~e does not have field ~e" left-type symbol))])
+                                                    (Field-type (hash-ref fields symbol))))
            (error 'type-check-expression "Field access requires a structure type; given expression ~e of type ~e" left left-type)))]
     [(Invocation id arguments)
-     (let ([function-binding : Function-Binding (lookup-function id (Environment-functions env))]
-           [actual-arg-types : (Listof Expression-Type) (map (lambda ([arg : Expression]) (type-check-expression arg env)) arguments)])
-       (if (valid-arguments? (Function-Binding-args function-binding) actual-arg-types)
-           (Function-Binding-return-type function-binding)
+     (let ([function-type : Function-Type (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Function ~e is not defined." id))])
+                                            (hash-ref (Environment-functions env) id))]
+           [actual-arg-types : (Listof Expression-Type) (map (lambda ([arg : Expression]) (type-check-expression arg env func-type)) arguments)])
+       (if (valid-arguments? (Function-Type-args function-type) actual-arg-types)
+           (Function-Type-return-type function-type)
            (error 'type-check-expression "Invocation of function ~e failed type check; given expressions ~e of types ~e, expected types ~e"
-                     id arguments actual-arg-types (Function-Binding-args function-binding))))]
+                     id arguments actual-arg-types (Function-Type-args function-type))))]
     [(Allocation id)
-     (lookup-struct id (Environment-structs env))
+     (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Allocation failed; structure type ~e does not exist." id))])
+       (hash-ref (Environment-structs env) id))
      id]
-    [value
+    [literal
      (cond
-       [(equal? 'null value) 'null]
-       [(symbol? value)
-        (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Variable ~e is unbound: ~e" value (exn-message exn)))])
-          (lookup-id value (append (Function-Binding-locals (first (Environment-functions env)))
-                                   (Environment-globals env))))]
-       [(integer? value) 'int]
-       [(boolean? value) 'bool]
-       [else (error 'type-check-expression "Invalid expression type ~e" value)])]))
+       [(equal? 'null literal) 'null]
+       [(symbol? literal)
+        (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'type-check-expression "Variable ~e is unbound." literal))])
+          (hash-ref (Function-Type-locals func-type) literal (lambda () (hash-ref (Environment-globals env) literal))))]
+       [(integer? literal) 'int]
+       [(boolean? literal) 'bool]
+       [else (error 'type-check-expression "Invalid expression type ~e" literal)])]))
 
 ;; binds a list of structs to their corresponding type environments
-(define (bind-structs [new-structs : (Listof Struct)] [bound-struct-names : (Listof Symbol)]) : Struct-Type-Env
-  (cond
-    [(empty? new-structs) '()]
-    [else (let ([first-struct-binding : Struct-Binding (bind-struct (first new-structs) bound-struct-names)])
-            (let ([first-struct-fields : Variable-Type-Env (Struct-Binding-fields first-struct-binding)]
-                  [bound-struct-names : (Listof Symbol) (cons (Struct-Binding-name first-struct-binding) bound-struct-names)])
-              (let ([rest-struct-bindings : Struct-Type-Env (bind-structs (rest new-structs) bound-struct-names)])
-                (if (first-id-unique? (Struct-Binding-name first-struct-binding) (map Struct-Binding-name rest-struct-bindings))
-                    (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'bind-structs "Structure ~e's fields failed type check: ~e"
-                                                                            (Struct-Binding-name first-struct-binding) (exn-message exn)))])
-                      (verify-types (map Type-Binding-type first-struct-fields) bound-struct-names)
-                      (cons first-struct-binding rest-struct-bindings))
-                    (error 'bind-structs "Redeclaration of structure with identifier ~e is not allowed" (Struct-Binding-name first-struct-binding))))))]))
-          
-;; binds a single struct to a list of type bindings representing its fields
-(define (bind-struct [struct : Struct] [bound-struct-names : (Listof Symbol)]) : Struct-Binding
-  (match struct
-    [(Struct id fields)
-     (Struct-Binding id (bind-declarations fields (cons id bound-struct-names)))]))
+(define (bind-structs! [new-structs : (Listof Struct)] [existing-structs : Struct-Environment]) : Void
+  (define struct-counter 0)
+  (for-each (lambda ([struct : Struct])
+              (if (hash-has-key? existing-structs (Struct-id struct))
+                  (error 'bind-structs! "Redeclaration of structure with identifier ~e is not allowed" (Struct-id struct))
+                  (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'bind-structs! "Structure ~e's fields failed type check: ~e"
+                                                                          (Struct-id struct) (exn-message exn)))])
+                    (define fields (ann (make-hash '()) Field-Environment))
+                    (hash-set! existing-structs (Struct-id struct) (Struct-Type fields struct-counter))
+                    (bind-fields! (Struct-fields struct) existing-structs fields)
+                    (set! struct-counter (+ 1 struct-counter)))))
+            new-structs))
 
 ;; binds a list of declarations to their corresponding types
-(define (bind-declarations [declarations : (Listof Declaration)] [bound-struct-names : (Listof Symbol)]) : Variable-Type-Env
-  (cond
-    [(empty? declarations) '()]
-    [else (define first-binding (bind-declaration (first declarations)))
-          (define rest-bindings (bind-declarations (rest declarations) bound-struct-names))
-          (if (first-id-unique? (Type-Binding-name first-binding) (map Type-Binding-name rest-bindings))
-              (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'bind-declarations (exn-message exn)))])
-                (verify-type (Type-Binding-type first-binding) bound-struct-names)
-                (cons first-binding rest-bindings))
-              (error 'bind-declarations "Redeclaration of variable with identifier ~e is not allowed" (Type-Binding-name first-binding)))]))
+(define (bind-fields! [declarations : (Listof Declaration)] [structs : Struct-Environment] [fields : Field-Environment]) : Void
+  (define field-counter 0)
+  (for-each (lambda ([dec : Declaration])
+              (if (hash-has-key? fields (Declaration-id dec))
+                  (error 'bind-declarations! "Redeclaration of structure field with identifier ~e is not allowed" (Declaration-id dec))
+                  (cond [(and (structure-type? (Declaration-type dec)) (not (hash-has-key? structs (Declaration-type dec))))
+                         (error 'bind-declarations! "Structure type ~e is not defined." (Declaration-type dec))]
+                        [else (hash-set! fields (Declaration-id dec) (Field (Declaration-type dec) field-counter))
+                              (set! field-counter (+ 1 field-counter))])))
+            declarations))
 
-;; binds an id to a type
-(define (bind-declaration [declaration : Declaration]) : Type-Binding
-  (match declaration
-    [(Declaration type id)
-     (Type-Binding id type)]))
-
-;; is the first ID unique among a list of IDs?
-(define (first-id-unique? [first-id : Symbol] [rest-ids : (Listof Symbol)]) : Boolean
-  (cond
-    [(empty? rest-ids) #t]
-    [else (if (equal? first-id (first rest-ids))
-              #f
-              (first-id-unique? first-id (rest rest-ids)))]))
-
-;; verifies that the given types are all defined in the environment
-(define (verify-types [new-types : (Listof Type)] [bound-struct-names : (Listof Symbol)]) : Void
-  (cond [(not (empty? new-types))
-         (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'verify-types (exn-message exn)))])
-           (verify-type (first new-types) bound-struct-names)
-           (verify-types (rest new-types) bound-struct-names))]))
-
-;; verifies that a single type is defined in the environment
-(define (verify-type [new-type : Type] [bound-struct-names : (Listof Symbol)]) : Void
-  (cond [(structure-type? new-type)
-         (with-handlers ([exn:fail? (lambda ([exn : exn]) (error 'verify-type (exn-message exn)))])
-             (verify-struct-id new-type bound-struct-names))]))
-
-;; verifies that a single struct id is defined in the environment
-(define (verify-struct-id [id : Symbol] [bound-struct-names : (Listof Symbol)]) : Void
-  (cond 
-    [(empty? bound-struct-names) (error 'verify-struct-id "Identifier ~e is not defined or is out of scope" id)]
-    [else (cond [(not (equal? id (first bound-struct-names)))
-                 (verify-struct-id id (rest bound-struct-names))])]))
-
-;; gets the function binding for a function with a given id
-(define (lookup-function [id : Symbol] [functions : Function-Type-Env]) : Function-Binding
-  (cond
-    [(empty? functions) (error 'lookup-function "Type check failed: function ~e has not been defined" id)]
-    [else (if (equal? id (Function-Binding-name (first functions)))
-               (first functions)
-               (lookup-function id (rest functions)))]))
-
-;; gets the field declarations for the struct with the given id
-(define (lookup-struct [id : Symbol] [structs : Struct-Type-Env]) : Variable-Type-Env
-  (cond
-    [(empty? structs) (error 'lookup-struct "Type check failed: struct ~e has not been defined" id)]
-    [else (if (equal? id (Struct-Binding-name (first structs)))
-              (Struct-Binding-fields (first structs))
-              (lookup-struct id (rest structs)))]))
-
-;; gets the type of the given identifier
-(define (lookup-id [id : Symbol] [vars : Variable-Type-Env]) : Type
-  (cond
-    [(empty? vars) (error 'lookup-id "Type check failed: id ~e has not been defined" id)]
-    [else (if (equal? id (Type-Binding-name (first vars)))
-              (Type-Binding-type (first vars))
-              (lookup-id id (rest vars)))]))
+;; binds a list of declarations to their corresponding types
+(define (bind-declarations! [declarations : (Listof Declaration)] [structs : Struct-Environment] [var-env : Variable-Environment]) : Void
+  (for-each (lambda ([dec : Declaration])
+              (if (hash-has-key? var-env (Declaration-id dec))
+                  (error 'bind-declarations! "Redeclaration of variable with identifier ~e is not allowed" (Declaration-id dec))
+                  (cond [(and (structure-type? (Declaration-type dec)) (not (hash-has-key? structs (Declaration-type dec))))
+                         (error 'bind-declarations! "Structure type ~e is not defined." (Declaration-type dec))]
+                        [else (hash-set! var-env (Declaration-id dec) (Declaration-type dec))])))
+            declarations))
 
 ;; are the supplied function arguments valid?
 (define (valid-arguments? [expected-types : (Listof Type)] [actual-types : (Listof Expression-Type)]) : Boolean
@@ -445,7 +375,7 @@
              (list (cons 'entry-block entry-block)
                    (cons 'exit-block exit-block)))
             Block-Table))
-     (add-statements-LLVM! entry-block blocks statements (get-cur-env env name))
+     (add-statements-LLVM! entry-block blocks statements env name)
      (map remove-trivial-phis! (map Block-LLVM (hash-values blocks)) (hash-values blocks))
      (cond
        [(Block-reachable exit-block) (cleanup-exit-block exit-block return-type)])
@@ -453,50 +383,50 @@
 
 ;; adds the LLVM for the given list of statements to the supplied block
 ;; updates the block hash table accordingly
-(define (add-statements-LLVM! [cur-block : Block] [blocks : Block-Table] [statements : (Listof Statement)] [env : Environment]) : Block
+(define (add-statements-LLVM! [cur-block : Block] [blocks : Block-Table] [statements : (Listof Statement)] [env : Environment] [func-name : Symbol]) : Block
   (if (empty? statements)
       cur-block
       (match (first statements)
         [(Block-Expr statement-list)
-         (add-statements-LLVM! cur-block blocks (append statement-list (rest statements)) env)]
+         (add-statements-LLVM! cur-block blocks (append statement-list (rest statements)) env func-name)]
         [(Assignment target source)
          (if (equal? source 'read)
-             (add-read-LLVM! target cur-block env)
-             (add-assignment-LLVM! target source cur-block env))
-         (add-statements-LLVM! cur-block blocks (rest statements) env)]
+             (add-read-LLVM! target cur-block env func-name)
+             (add-assignment-LLVM! target source cur-block env func-name))
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
         [(Print expression endl)
-         (define exp-operand (add-expression-LLVM! expression cur-block env))
+         (define exp-operand (add-expression-LLVM! expression cur-block env func-name))
          (define target (Intermediate counter))
          (set! counter (+ 1 counter))
          (add-LLVM! cur-block (Print-Instr exp-operand endl target))
          (if endl
              (set-C-Lib-Funcs-printf-newline! c-lib-funcs #t)
              (set-C-Lib-Funcs-printf-space! c-lib-funcs #t))
-         (add-statements-LLVM! cur-block blocks (rest statements) env)]
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
         [(If guard then)
-         (define guard-operand (add-expression-LLVM! guard cur-block env))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
          (define then-block (create-block (list cur-block) #t blocks))
-         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env))
+         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name))
          (define after-block (create-block (list cur-block) #t blocks))
          (add-branch! last-then-block after-block)
          (add-LLVM! cur-block (Cond-Branch-Instr guard-operand then-block after-block))
-         (add-statements-LLVM! after-block blocks (rest statements) env)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
         [(If-Else guard then else)
-         (define guard-operand (add-expression-LLVM! guard cur-block env))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
          (define then-block (create-block (list cur-block) #t blocks))
          (define else-block (create-block (list cur-block) #t blocks))
          (add-LLVM! cur-block (Cond-Branch-Instr guard-operand then-block else-block))
-         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env))
-         (define last-else-block (add-statements-LLVM! else-block blocks (list else) env))
+         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name))
+         (define last-else-block (add-statements-LLVM! else-block blocks (list else) env func-name))
          (define after-block (create-block (list last-then-block last-else-block) #t blocks))
          (add-branch! last-then-block after-block)
          (add-branch! last-else-block after-block)
-         (add-statements-LLVM! after-block blocks (rest statements) env)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
         [(Loop guard body)
-         (define guard-operand (add-expression-LLVM! guard cur-block env))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
          (define body-block (create-block (list cur-block) #f blocks))
-         (define last-body-block (add-statements-LLVM! body-block blocks (list body) env))
-         (define new-guard-operand (add-expression-LLVM! guard last-body-block env))
+         (define last-body-block (add-statements-LLVM! body-block blocks (list body) env func-name))
+         (define new-guard-operand (add-expression-LLVM! guard last-body-block env func-name))
          (define after-block (create-block (list cur-block last-body-block) #t blocks))
          (add-LLVM! cur-block (Cond-Branch-Instr guard-operand body-block after-block))
          (set-Block-successors! cur-block (list body-block after-block))
@@ -504,17 +434,21 @@
          (cond
            [(equal? mode 'registers) (complete-phis! (Block-LLVM body-block) body-block)
                                      (set-Block-sealed! body-block #t)])
-         (add-statements-LLVM! after-block blocks (rest statements) env)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
         [(Delete expression)
-         (define exp-operand (add-expression-LLVM! expression cur-block env))
-         (add-LLVMs! cur-block (list (Size-Instr 'bitcast exp-operand (string-append "%struct." (symbol->string (type-check-expression expression env)) "*") "i8*" (Intermediate counter))
+         (define exp-operand (add-expression-LLVM! expression cur-block env func-name))
+         (add-LLVMs! cur-block (list (Size-Instr 'bitcast
+                                                 exp-operand
+                                                 (string-append "%struct." (symbol->string (type-check-expression expression env (hash-ref (Environment-functions env) func-name))) "*")
+                                                 "i8*"
+                                                 (Intermediate counter))
                                      (Free-Instr (Intermediate counter))))
          (set! counter (+ 1 counter))
          (set-C-Lib-Funcs-free! c-lib-funcs #t)
-         (add-statements-LLVM! cur-block blocks (rest statements) env)]
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
         [(Return expression)
-         (define result (add-expression-LLVM! expression cur-block env))
-         (define return-type (Function-Binding-return-type (first (Environment-functions env))))
+         (define result (add-expression-LLVM! expression cur-block env func-name))
+         (define return-type (Function-Type-return-type (hash-ref (Environment-functions env) func-name)))
          (define exit-block (hash-ref blocks 'exit-block))
          (if (equal? (Block-label cur-block) (Block-label (hash-ref blocks 'entry-block)))
              (add-LLVM! cur-block (Return-Expr-Instr return-type result))
@@ -538,19 +472,19 @@
               (set-Block-reachable! exit-block #t)))
          cur-block]
         [(Invocation id arguments)
-         (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env)) arguments))
-         (define function (lookup-function id (Environment-functions env)))
-         (add-LLVM! cur-block (Call-Instr (Global id) (Function-Binding-return-type function) (Function-Binding-args function) args (Intermediate counter)))
+         (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
+         (define function (hash-ref (Environment-functions env) func-name))
+         (add-LLVM! cur-block (Call-Instr (Global id) (Function-Type-return-type function) (Function-Type-args function) args (Intermediate counter)))
          (set! counter (+ counter 1))
-         (add-statements-LLVM! cur-block blocks (rest statements) env)])))
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)])))
 
 ;; adds the LLVM for the given expression to the supplied block
 ;; returns the operand that holds the result of this expression
-(define (add-expression-LLVM! [expression : Expression] [cur-block : Block] [env : Environment]) : Operand
+(define (add-expression-LLVM! [expression : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Operand
   (match expression
     [(Binary operator left right)
-     (define left-result (add-expression-LLVM! left cur-block env))
-     (define right-result (add-expression-LLVM! right cur-block env))
+     (define left-result (add-expression-LLVM! left cur-block env func-name))
+     (define right-result (add-expression-LLVM! right cur-block env func-name))
      (define target (get-target))
      (cond [(member operator (list '+ '- '* '/))
             (add-LLVM! cur-block (Arith-Instr operator left-result right-result target))]
@@ -558,32 +492,32 @@
             (add-LLVM! cur-block (Bool-Instr operator left-result right-result target))]
            [(member operator (list '== '!= '< '> '<= '>=))
             (define type (if (or (equal? operator '==) (equal? operator '!=))
-                             (type-check-expression left env)
+                             (type-check-expression left env (hash-ref (Environment-functions env) func-name))
                              'int))
             (add-LLVM! cur-block (Comp-Instr operator type left-result right-result target))])
      target]
     [(Unary operator expression)
-     (define result (add-expression-LLVM! expression cur-block env))
+     (define result (add-expression-LLVM! expression cur-block env func-name))
      (define target (get-target))
      (cond [(equal? operator '-) (add-LLVM! cur-block (Arith-Instr '- 0 result target))]
            [(equal? operator '!) (add-LLVM! cur-block (Bool-Instr '^^ result #t target))])
      target]
     [(Selector left id)
      (define pointer (if (symbol? left)
-                         (if (global-variable? left (Environment-globals env)) (Global left) (Local left))
-                         (add-expression-LLVM! left cur-block env)))
-     (define type (type-check-expression left env))
+                         (if (hash-has-key? (Environment-globals env) left) (Global left) (Local left))
+                         (add-expression-LLVM! left cur-block env func-name)))
+     (define type (type-check-expression left env (hash-ref (Environment-functions env) func-name)))
      (define target (get-target))
      (define next-target (get-target))
-     (define field (get-field type id (Environment-structs env)))
-     (add-LLVMs! cur-block (list (Get-Elm-Ptr-Instr type pointer (Field-offset field) target) 
-                             (Load-Instr (Field-type field) target next-target (if (structure-type? (Field-type field)) 1 0))))
+     (define field (hash-ref (Struct-Type-fields (hash-ref (Environment-structs env) type)) id))
+     (add-LLVMs! cur-block (list (Get-Elm-Ptr-Instr type pointer (Field-index field) target) 
+                                 (Load-Instr (Field-type field) target next-target (if (structure-type? (Field-type field)) 1 0))))
      next-target]
     [(Invocation id arguments)
-     (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env)) arguments))
+     (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
      (define target (get-target))
-     (define function (lookup-function id (Environment-functions env)))
-     (add-LLVM! cur-block (Call-Instr (Global id) (Function-Binding-return-type function) (Function-Binding-args function) args target))
+     (define function (hash-ref (Environment-functions env) id))
+     (add-LLVM! cur-block (Call-Instr (Global id) (Function-Type-return-type function) (Function-Type-args function) args target))
      target]
     [(Allocation id)
      (define first-target (get-target))
@@ -592,41 +526,41 @@
      (add-LLVM! cur-block (Malloc-Instr first-target))
      (add-LLVM! cur-block (Size-Instr 'bitcast first-target "i8*" (string-append "%struct." (symbol->string id) "*") second-target))
      second-target]
-    [value
+    [literal
      (cond
-       [(equal? 'null value) 'null]
-       [(symbol? value)
-        (define declaration (get-declaration value (Function-Binding-locals (first (Environment-functions env))) (Environment-globals env)))
+       [(equal? 'null literal) 'null]
+       [(symbol? literal)
+        (define declaration (get-declaration literal (Function-Type-locals (hash-ref (Environment-functions env) func-name)) (Environment-globals env)))
         (define type (LLVM-Declaration-type declaration))
         (cond
           [(equal? mode 'stack)
            (define target (get-target))
            (add-LLVM! cur-block (Load-Instr type (LLVM-Declaration-operand declaration) target (if (structure-type? type) 1 0)))
            target]
-          [(equal? mode 'registers) (Phi-Value-operand (read-variable value type cur-block))]
+          [(equal? mode 'registers) (Phi-Value-operand (read-variable literal type cur-block))]
           [else (error 'add-expression-LLVM! "Unsupported compiler mode, given ~e" mode)])]
-       [(integer? value) value]
-       [(boolean? value) value]
-       [else (error 'add-expression-LLVM! "Invalid expression type ~e" value)])]))
+       [(integer? literal) literal]
+       [(boolean? literal) literal]
+       [else (error 'add-expression-LLVM! "Invalid expression type ~e" literal)])]))
 
 ;; adds the LLVM for a read instruction to the current block
-(define (add-read-LLVM! [target : Expression] [cur-block : Block] [env : Environment]) : Void
+(define (add-read-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Void
   (set-C-Lib-Funcs-scanf! c-lib-funcs #t)
   (cond
     [(equal? mode 'stack)
      (define target-operand
        (if (symbol? target)
-           (if (global-variable? target (Environment-globals env))
+           (if (hash-has-key? (Environment-globals env) target)
                (Global target)
                (Local target)) 
-           (add-expression-LLVM! target cur-block env)))
+           (add-expression-LLVM! target cur-block env func-name)))
      (Scan-Instr target-operand (Intermediate counter))
      (set! counter (+ 1 counter))]
     [(equal? mode 'registers)
      (cond
        [(symbol? target)
         (cond
-          [(global-variable? target (Environment-globals env))
+          [(hash-has-key? (Environment-globals env) target)
            (Scan-Instr (Global target) (Intermediate counter))
            (set! counter (+ 1 counter))]
           [else (Alloca-Instr 'int (Intermediate counter))
@@ -634,31 +568,31 @@
                 (Load-Instr 'int (Intermediate counter) (Register (+ 2 counter)) 0)
                 (write-variable! target (Register (+ 2 counter)) cur-block)
                 (set! counter (+ 3 counter))])]
-       [else (Scan-Instr (add-expression-LLVM! target cur-block env) (Intermediate counter))
+       [else (Scan-Instr (add-expression-LLVM! target cur-block env func-name) (Intermediate counter))
              (set! counter (+ 1 counter))])]
     [else (error 'add-read-LLVM! "Unsupported compiler mode: ~e" mode)]))
 
 ;; adds the LLVM for an assignment instruction to the current block
-(define (add-assignment-LLVM! [target : Expression] [source : Expression] [cur-block : Block] [env : Environment]) : Void
+(define (add-assignment-LLVM! [target : Expression] [source : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Void
   (cond
     [(equal? mode 'stack)
      (define target-operand
        (if (symbol? target)
-           (if (global-variable? target (Environment-globals env))
+           (if (hash-has-key? (Environment-globals env) target)
                (Global target)
                (Local target))
-           (add-expression-LLVM! target cur-block env)))
-     (define source-operand (add-expression-LLVM! source cur-block env))
-     (add-LLVM! cur-block (Store-Instr (type-check-expression target env) source-operand target-operand 0))]
+           (add-expression-LLVM! target cur-block env func-name)))
+     (define source-operand (add-expression-LLVM! source cur-block env func-name))
+     (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand target-operand 0))]
     [(equal? mode 'registers)
-     (define source-operand (add-expression-LLVM! source cur-block env))
+     (define source-operand (add-expression-LLVM! source cur-block env func-name))
      (if (symbol? target)
-         (if (global-variable? target (Environment-globals env))
-             (add-LLVM! cur-block (Store-Instr (type-check-expression target env) source-operand (Global target) 0))
+         (if (hash-has-key? (Environment-globals env) target)
+             (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand (Global target) 0))
              (write-variable! target source-operand cur-block))
          (block
-          (define target-operand (add-expression-LLVM! target cur-block env))
-          (add-LLVM! cur-block (Store-Instr (type-check-expression target env) source-operand target-operand 0))))]
+          (define target-operand (add-expression-LLVM! target cur-block env func-name))
+          (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand target-operand 0))))]
     [else (error 'add-assignment-LLVM! "Unsupported compiler mode: ~e" mode)]))
 
 ;; complete the phis of the given block in the process of sealing it
@@ -689,7 +623,7 @@
                      (set-Block-LLVM! cur-block (cons (Phi-Instr var type '() target #f #f) (Block-LLVM cur-block)))
                      (write-variable! var target cur-block)
                      (Phi-Value target (Block-label cur-block))]
-       [(empty? predecessors) (error 'read-variable "Undefined behavior: ~e is not defined in block ~e" var cur-block)]
+       [(empty? predecessors) (error 'read-variable "Variable with identifier ~e has not been initialized" var)]
        [(equal? (length predecessors) 1) (define value (read-variable var type (first predecessors)))
                                          (write-variable! var (Phi-Value-operand value) cur-block)
                                          value]
@@ -732,28 +666,18 @@
       (if (equal? first-op (first rest-ops))
           (first-operand-matches-rest? first-op (rest rest-ops))
           #f)))
-
-;; is the variable in the global environment? (if not, it must be local)
-(define (global-variable? [var : Symbol] [globals : Variable-Type-Env]) : Boolean
-  (if (empty? globals)
-      #f
-      (or (equal? var (Type-Binding-name (first globals))) (global-variable? var (rest globals)))))
             
 ;; creates the struct instructions (struct definitions)
-(define (create-struct-instrs [structs : Struct-Type-Env]) : (Listof Struct-Instr)
-  (if (empty? structs)
-      '()
-      (cons (Struct-Instr (Struct-Binding-name (first structs))
-                          (map Type-Binding-type (Struct-Binding-fields (first structs))))
-            (create-struct-instrs (rest structs)))))
+(define (create-struct-instrs [structs : Struct-Environment]) : (Listof Struct-Instr)
+  (map (lambda ([struct : (cons Symbol Struct-Type)])
+         (Struct-Instr (car struct) (map Field-type (hash-values (Struct-Type-fields (cdr struct))))))
+       (sort (hash->list structs) struct<)))
 
 ;; creates the global instructions (declarations of global variables)
-(define (create-global-instrs [globals : Variable-Type-Env]) : (Listof Global-Instr)
-  (if (empty? globals)
-      '()
-      (cons (Global-Instr (Type-Binding-name (first globals))
-                          (Type-Binding-type (first globals)))
-            (create-global-instrs (rest globals)))))
+(define (create-global-instrs [globals : Variable-Environment]) : (Listof Global-Instr)
+  (map (lambda ([global : (cons Symbol Type)])
+         (Global-Instr (car global) (cdr global)))
+       (hash->list globals)))
 
 ;; adds a list of LLVM instructions to a block
 (define (add-LLVMs! [cur-block : Block] [LLVMs : (Listof LLVM-Instr)]) : Void
@@ -763,43 +687,12 @@
 (define (add-LLVM! [cur-block : Block] [LLVM : LLVM-Instr]) : Void
   (set-Block-LLVM! cur-block (append (Block-LLVM cur-block) (list LLVM))))
 
-;; gets the environment as defined while within the given function
-;; (implements the correct scope upon generating LLVM to ensure there is no access to functions created after this one in the file)
-(define (get-cur-env [env : Environment] [func-name : Symbol]) : Environment
-  (if (equal? func-name (Function-Binding-name (first (Environment-functions env))))
-      env
-      (get-cur-env (Environment (Environment-structs env) (Environment-globals env) (rest (Environment-functions env))) func-name)))
-
-;; gets the field information for a field in a struct
-(define (get-field [type : Type] [id : Symbol] [structs : Struct-Type-Env]) : Field
-  (if (equal? type (Struct-Binding-name (first structs)))
-      (Field (get-field-type id (Struct-Binding-fields (first structs)))
-             (get-field-offset id (Struct-Binding-fields (first structs))))
-      (get-field type id (rest structs))))
-
-;; gets the field type for a field in a struct
-(define (get-field-type [id : Symbol] [fields : Variable-Type-Env]) : Type
-  (if (equal? id (Type-Binding-name (first fields)))
-      (Type-Binding-type (first fields))
-      (get-field-type id (rest fields))))
-
-;; gets the field offset for a field in a struct
-(define (get-field-offset [id : Symbol] [fields : Variable-Type-Env]) : Integer
-  (if (equal? id (Type-Binding-name (first fields)))
-      0
-      (+ 1 (get-field-offset id (rest fields)))))
-
 ;; gets the declaration for a symbol from the environment
 ;; checks locals first (since local declarations can hide global ones) and then globals
-(define (get-declaration [id : Symbol] [locals : Variable-Type-Env] [globals : Variable-Type-Env]) : LLVM-Declaration
-  (cond
-    [(and (empty? locals) (empty? globals)) (error 'get-declaration "undefined behavior: ~e is not defined" id)]
-    [(empty? locals) (if (equal? id (Type-Binding-name (first globals)))
-                         (LLVM-Declaration (Type-Binding-type (first globals)) (Global id))
-                         (get-declaration id '() (rest globals)))]
-    [else (if (equal? id (Type-Binding-name (first locals)))
-              (LLVM-Declaration (Type-Binding-type (first locals)) (Local id))
-              (get-declaration id (rest locals) globals))]))
+(define (get-declaration [id : Symbol] [locals : Variable-Environment] [globals : Variable-Environment]) : LLVM-Declaration
+  (if (hash-has-key? locals id)
+      (LLVM-Declaration (hash-ref locals id) (Local id))
+      (LLVM-Declaration (hash-ref globals id) (Global id))))
 
 ;; generates a visual representation of the CFG using dot!
 (define (generate-graph [program : LLVM-Program] [input-filename : String]) : Void
@@ -1177,6 +1070,10 @@
 ;; defines the inequality used to sort blocks in the block hash table (integer comparison on the block labels)
 (define (block< [block1 : Block] [block2 : Block]) : Boolean
   (< (Block-label block1) (Block-label block2)))
+
+;; defines the inequality used to sort structs in the struct environment hash table (used to preserve struct definition order)
+(define (struct< [struct1 : (cons Symbol Struct-Type)] [struct2 : (cons Symbol Struct-Type)]) : Boolean
+  (< (Struct-Type-index (cdr struct1)) (Struct-Type-index (cdr struct2))))
 
 ;; set compiler mode from string
 (define (set-compiler-mode! [flag : String]) : Void

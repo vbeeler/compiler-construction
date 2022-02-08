@@ -38,38 +38,40 @@
 
 ;; TYPE ENVIRONMENT
 
-(define-type Variable-Type-Env (Listof Type-Binding))
-(struct Type-Binding ([name : Symbol] [type : Type]) #:transparent)
+(struct Field ([type : Type] [index : Integer]) #:transparent)
+(struct Struct-Type ([fields : Field-Environment] [index : Integer]) #:transparent)
+(struct Function-Type ([args : (Listof Type)] [return-type : Return-Type] [locals : Variable-Environment]) #:transparent #:mutable)
 
-(define-type Struct-Type-Env (Listof Struct-Binding))
-(struct Struct-Binding ([name : Symbol] [fields : Variable-Type-Env]) #:transparent)
+(define-type Variable-Environment (Mutable-HashTable Symbol Type))
+(define-type Field-Environment (Mutable-HashTable Symbol Field))
+(define-type Struct-Environment (Mutable-HashTable Symbol Struct-Type))
+(define-type Function-Environment (Mutable-HashTable Symbol Function-Type))
 
-(define-type Function-Type-Env (Listof Function-Binding))
-(struct Function-Binding ([name : Symbol] [args : (Listof Type)] [return-type : Return-Type] [locals : Variable-Type-Env]) #:transparent #:mutable)
-
-(struct Environment ([structs : Struct-Type-Env]
-                     [globals : Variable-Type-Env]
-                     [functions : Function-Type-Env])
+(struct Environment ([structs : Struct-Environment]
+                     [globals : Variable-Environment]
+                     [functions : Function-Environment])
   #:transparent #:mutable)
 
 ;; base local variable environment
-(define base-local-env
-  (list
-   (Type-Binding 'read 'int)))
+(define (base-local-env)
+  (ann (make-hash
+        (list (cons 'read 'int)))
+       Variable-Environment))
 
 ;; base function environment - function bindings for binary functions
-(define base-function-env
-  (list
-   (Function-Binding '+ (list 'int 'int) 'int base-local-env)
-   (Function-Binding '- (list 'int 'int) 'int base-local-env)
-   (Function-Binding '* (list 'int 'int) 'int base-local-env)
-   (Function-Binding '/ (list 'int 'int) 'int base-local-env)
-   (Function-Binding '< (list 'int 'int) 'bool base-local-env)
-   (Function-Binding '> (list 'int 'int) 'bool base-local-env)
-   (Function-Binding '<= (list 'int 'int) 'bool base-local-env)
-   (Function-Binding '>= (list 'int 'int) 'bool base-local-env)
-   (Function-Binding '|| (list 'bool 'bool) 'bool base-local-env)
-   (Function-Binding '&& (list 'bool 'bool) 'bool base-local-env)))
+(define (base-function-env)
+  (ann (make-hash
+        (list (cons '+ (Function-Type (list 'int 'int) 'int (base-local-env)))
+              (cons '- (Function-Type (list 'int 'int) 'int (base-local-env)))
+              (cons '* (Function-Type (list 'int 'int) 'int (base-local-env)))
+              (cons '/ (Function-Type (list 'int 'int) 'int (base-local-env)))
+              (cons '< (Function-Type (list 'int 'int) 'bool (base-local-env)))
+              (cons '> (Function-Type (list 'int 'int) 'bool (base-local-env)))
+              (cons '<= (Function-Type (list 'int 'int) 'bool (base-local-env)))
+              (cons '>= (Function-Type (list 'int 'int) 'bool (base-local-env)))
+              (cons '|| (Function-Type (list 'bool 'bool) 'bool (base-local-env)))
+              (cons '&& (Function-Type (list 'bool 'bool) 'bool (base-local-env)))))
+       Function-Environment))
 
 ;; Control Flow Graph (CFG)
 
@@ -134,7 +136,6 @@
                      [printf-space : Boolean]
                      [scanf : Boolean])
   #:transparent #:mutable)
-(struct Field ([type : Type] [offset : Integer]) #:transparent)
 (struct Levels-Indirection ([primitive : Integer] [struct : Integer]) #:transparent)
 (struct LLVM-Declaration ([type : Type] [operand : Operand]) #:transparent)
 (struct Phi-Value ([operand : Operand] [block-label : Integer]) #:transparent)
