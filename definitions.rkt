@@ -76,20 +76,21 @@
 (struct CFG ([func-name : Symbol] [parameters : (Listof Declaration)] [return-type : Return-Type] [blocks : Block-Table]) #:transparent) 
 (struct Block ([label : Integer]
                [LLVM : (Listof LLVM-Instr)]
-               [definitions : (Listof LLVM-Definition)]
+               [definitions : Definition-Table]
                [predecessors : (Listof Block)]
                [successors : (Listof Block)]
                [reachable : Boolean]
                [sealed : Boolean])
   #:transparent #:mutable)
-(define-type Block-Label (U Integer 'exit-block))
+(define-type Block-Label (U Integer 'entry-block 'exit-block))
 (define-type Block-Table (Mutable-HashTable Block-Label Block))
+(define-type Definition-Table (Mutable-HashTable Symbol Operand))
 
-;; LLVM Instructions
+;; LLVM INSTRUCTIONS
 
 (define-type LLVM-Instr (U Alloca-Instr Arith-Instr Bool-Instr Comp-Instr Size-Instr Get-Elm-Ptr-Instr
                            Call-Instr Malloc-Instr Free-Instr Load-Instr Store-Instr Print-Instr Scan-Instr
-                           Branch-Instr Cond-Branch-Instr Return-Expr-Instr Return-Void-Instr Phi-Instr))
+                           Branch-Instr Cond-Branch-Instr Return-Expr-Instr Return-Void-Instr Phi-Instr Move-Instr))
 (struct Alloca-Instr ([type : Type] [target : Target]) #:transparent)
 (struct Arith-Instr ([operator : Arith-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
 (struct Bool-Instr ([operator : Bool-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
@@ -108,7 +109,8 @@
 (struct Cond-Branch-Instr ([cond : Operand] [true : Block] [false : Block]) #:transparent)
 (struct Return-Expr-Instr ([type : Type] [expr : Operand]) #:transparent)
 (struct Return-Void-Instr [] #:transparent)
-(struct Phi-Instr ([block : Block] [var : Symbol]) #:transparent)
+(struct Phi-Instr ([var : Symbol] [type : Type] [values : (Listof Phi-Value)] [target : Operand] [complete : Boolean] [removed : Boolean]) #:transparent #:mutable)
+(struct Move-Instr ([target : Operand] [source : Operand]) #:transparent)
 
 ;; LLVM operators
 (define-type Operator (U Arith-Operator Bool-Operator Comp-Operator Size-Operator))
@@ -126,7 +128,6 @@
 (struct Register ([num : Integer]) #:transparent)
 (define-type Operand (U Literal Local Global Intermediate Register Block))
 (define-type Target (U Local Global Intermediate Register))
-(define-type Definition-Value (U Register Literal))
 (struct C-Lib-Funcs ([malloc : Boolean]
                      [free : Boolean]
                      [printf-newline : Boolean]
@@ -136,7 +137,7 @@
 (struct Field ([type : Type] [offset : Integer]) #:transparent)
 (struct Levels-Indirection ([primitive : Integer] [struct : Integer]) #:transparent)
 (struct LLVM-Declaration ([type : Type] [operand : Operand]) #:transparent)
-(struct LLVM-Definition ([var : Symbol] [value : Definition-Value]) #:transparent #:mutable)
+(struct Phi-Value ([operand : Operand] [block-label : Integer]) #:transparent)
 
 ;; LLVM Program
 (struct Struct-Instr ([name : Symbol] [fields : (Listof Type)]) #:transparent)
@@ -147,5 +148,5 @@
                       [c-lib-funcs : C-Lib-Funcs])
   #:transparent)
 
-;; Compiler Specifications
+;; Compiler Specifications/Information
 (define-type Compiler-Mode (U 'stack 'registers))

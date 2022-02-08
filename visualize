@@ -1,0 +1,7 @@
+#!/bin/bash
+
+for mini in "$@"
+do 
+   racket visualize-cfg.rkt $(java -jar ../mile1/given/MiniCompiler.jar $mini) $mini
+done
+

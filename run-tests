@@ -1,0 +1,7 @@
+#!/bin/bash
+
+for mini in "$@"
+do 
+   racket test_cmd_line.rkt $mini $(java -jar ../mile1/given/MiniCompiler.jar $mini)
+done
+
