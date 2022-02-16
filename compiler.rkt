@@ -72,6 +72,8 @@
        (Invocation (string->symbol id) (parse args))]
       [(hash-table ('stmt "delete") ('exp expression))
        (Delete (parse expression))]
+      [(hash-table ('left left) ('id id))
+       (Selector (parse left) (string->symbol id))]
       [(hash-table ('id id)) (string->symbol id)]
       [(cons first rest)
        (cons (parse first) (parse rest))])))
@@ -377,8 +379,14 @@
             Block-Table))
      (add-statements-LLVM! entry-block blocks statements env name)
      (map remove-trivial-phis! (map Block-LLVM (hash-values blocks)) (hash-values blocks))
-     (cond
-       [(Block-reachable exit-block) (cleanup-exit-block exit-block return-type)])
+     (cond [(not (empty? (Block-successors entry-block)))
+            (set-Block-reachable! exit-block #t)
+            (cleanup-exit-block exit-block return-type)
+            (add-return-voids! entry-block exit-block (make-hash '()))]
+           [(and (equal? return-type 'void)
+                 (or (empty? (Block-LLVM entry-block))
+                     (not (Return-Void-Instr? (last (Block-LLVM entry-block))))))
+            (add-LLVM! entry-block (Return-Void-Instr))])
      (CFG name parameters return-type blocks)]))
 
 ;; adds the LLVM for the given list of statements to the supplied block
@@ -414,10 +422,10 @@
         [(If-Else guard then else)
          (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
          (define then-block (create-block (list cur-block) #t blocks))
-         (define else-block (create-block (list cur-block) #t blocks))
-         (add-LLVM! cur-block (Cond-Branch-Instr guard-operand then-block else-block))
          (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name))
+         (define else-block (create-block (list cur-block) #t blocks))
          (define last-else-block (add-statements-LLVM! else-block blocks (list else) env func-name))
+         (add-LLVM! cur-block (Cond-Branch-Instr guard-operand then-block else-block))
          (define after-block (create-block (list last-then-block last-else-block) #t blocks))
          (add-branch! last-then-block after-block)
          (add-branch! last-else-block after-block)
@@ -458,8 +466,7 @@
                 [(equal? mode 'registers) (write-variable! 'return result cur-block)])
               (add-LLVM! cur-block (Branch-Instr exit-block))
               (set-Block-successors! cur-block (list exit-block))
-              (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))
-              (set-Block-reachable! exit-block #t)))
+              (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))))
          cur-block]
         [(Return-Void)
          (define exit-block (hash-ref blocks 'exit-block))
@@ -468,14 +475,15 @@
              (block
               (add-LLVM! cur-block (Branch-Instr exit-block))
               (set-Block-successors! cur-block (list exit-block))
-              (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))
-              (set-Block-reachable! exit-block #t)))
+              (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))))
          cur-block]
         [(Invocation id arguments)
          (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
-         (define function (hash-ref (Environment-functions env) func-name))
-         (add-LLVM! cur-block (Call-Instr (Global id) (Function-Type-return-type function) (Function-Type-args function) args (Intermediate counter)))
-         (set! counter (+ counter 1))
+         (define function (hash-ref (Environment-functions env) id))
+         (define return-type (Function-Type-return-type function))
+         (if (equal? 'void return-type)
+             (add-LLVM! cur-block (Call-Void-Instr (Global id) (Function-Type-args function) args))
+             (add-LLVM! cur-block (Call-Instr (Global id) return-type (Function-Type-args function) args (get-target))))
          (add-statements-LLVM! cur-block blocks (rest statements) env func-name)])))
 
 ;; adds the LLVM for the given expression to the supplied block
@@ -503,15 +511,11 @@
            [(equal? operator '!) (add-LLVM! cur-block (Bool-Instr '^^ result #t target))])
      target]
     [(Selector left id)
-     (define pointer (if (symbol? left)
-                         (if (hash-has-key? (Environment-globals env) left) (Global left) (Local left))
-                         (add-expression-LLVM! left cur-block env func-name)))
+     (define pointer (add-selector-LLVM! expression cur-block env func-name))
      (define type (type-check-expression left env (hash-ref (Environment-functions env) func-name)))
-     (define target (get-target))
      (define next-target (get-target))
      (define field (hash-ref (Struct-Type-fields (hash-ref (Environment-structs env) type)) id))
-     (add-LLVMs! cur-block (list (Get-Elm-Ptr-Instr type pointer (Field-index field) target) 
-                                 (Load-Instr (Field-type field) target next-target (if (structure-type? (Field-type field)) 1 0))))
+     (add-LLVM! cur-block (Load-Instr (Field-type field) pointer next-target (if (structure-type? (Field-type field)) 1 0)))
      next-target]
     [(Invocation id arguments)
      (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
@@ -523,7 +527,7 @@
      (define first-target (get-target))
      (define second-target (get-target))
      (set-C-Lib-Funcs-malloc! c-lib-funcs #t)
-     (add-LLVM! cur-block (Malloc-Instr first-target))
+     (add-LLVM! cur-block (Malloc-Instr first-target (get-struct-size (hash->list (Struct-Type-fields (hash-ref (Environment-structs env) id))))))
      (add-LLVM! cur-block (Size-Instr 'bitcast first-target "i8*" (string-append "%struct." (symbol->string id) "*") second-target))
      second-target]
     [literal
@@ -553,23 +557,23 @@
            (if (hash-has-key? (Environment-globals env) target)
                (Global target)
                (Local target)) 
-           (add-expression-LLVM! target cur-block env func-name)))
-     (Scan-Instr target-operand (Intermediate counter))
-     (set! counter (+ 1 counter))]
+           (add-selector-LLVM! target cur-block env func-name)))
+     (add-LLVM! cur-block (Scan-Instr target-operand (get-target)))]
     [(equal? mode 'registers)
      (cond
        [(symbol? target)
         (cond
           [(hash-has-key? (Environment-globals env) target)
-           (Scan-Instr (Global target) (Intermediate counter))
-           (set! counter (+ 1 counter))]
-          [else (Alloca-Instr 'int (Intermediate counter))
-                (Scan-Instr (Intermediate counter) (Intermediate (+ 1 counter)))
-                (Load-Instr 'int (Intermediate counter) (Register (+ 2 counter)) 0)
-                (write-variable! target (Register (+ 2 counter)) cur-block)
-                (set! counter (+ 3 counter))])]
-       [else (Scan-Instr (add-expression-LLVM! target cur-block env func-name) (Intermediate counter))
-             (set! counter (+ 1 counter))])]
+           (add-LLVM! cur-block (Scan-Instr (Global target) (get-target)))]
+          [else
+           (define first-target (get-target))
+           (define second-target (get-target))
+           (define third-target (get-target))
+           (add-LLVMs! cur-block (list (Alloca-Instr 'int first-target)
+                                       (Scan-Instr first-target second-target)
+                                       (Load-Instr 'int first-target third-target 0)))
+           (write-variable! target third-target cur-block)])]
+       [else (add-LLVM! cur-block (Scan-Instr (add-selector-LLVM! target cur-block env func-name) (get-target)))])]
     [else (error 'add-read-LLVM! "Unsupported compiler mode: ~e" mode)]))
 
 ;; adds the LLVM for an assignment instruction to the current block
@@ -581,22 +585,46 @@
            (if (hash-has-key? (Environment-globals env) target)
                (Global target)
                (Local target))
-           (add-expression-LLVM! target cur-block env func-name)))
+           (add-selector-LLVM! target cur-block env func-name)))
      (define source-operand (add-expression-LLVM! source cur-block env func-name))
-     (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand target-operand 0))]
+     (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
+     (add-LLVM! cur-block (Store-Instr type source-operand target-operand (if (structure-type? type) 1 0)))]
     [(equal? mode 'registers)
      (define source-operand (add-expression-LLVM! source cur-block env func-name))
      (if (symbol? target)
          (if (hash-has-key? (Environment-globals env) target)
-             (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand (Global target) 0))
+             (block
+              (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
+              (add-LLVM! cur-block (Store-Instr type source-operand (Global target) (if (structure-type? type) 1 0))))
              (write-variable! target source-operand cur-block))
          (block
-          (define target-operand (add-expression-LLVM! target cur-block env func-name))
-          (add-LLVM! cur-block (Store-Instr (type-check-expression target env (hash-ref (Environment-functions env) func-name)) source-operand target-operand 0))))]
+          (define target-operand (add-selector-LLVM! target cur-block env func-name))
+          (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
+          (add-LLVM! cur-block (Store-Instr type source-operand target-operand (if (structure-type? type) 1 0)))))]
     [else (error 'add-assignment-LLVM! "Unsupported compiler mode: ~e" mode)]))
 
+;; adds the LLVM for a selector to the current block - simply gets the address of the desired field
+;; this method is necessary since there is different behavior for selectors as right vs left values of assignments (need value vs address respectively)
+(define (add-selector-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Operand
+  (match target
+    [(Selector left id)
+     (define type (type-check-expression left env (hash-ref (Environment-functions env) func-name)))
+     (define pointer (if (symbol? left)            
+                         (if (hash-has-key? (Environment-globals env) left)
+                             (Global left)
+                             (block
+                              (define target (get-target))
+                              (add-LLVM! cur-block (Load-Instr type (Local left) target 1))
+                              target))
+                         (add-expression-LLVM! left cur-block env func-name)))
+     (define first-target (get-target))
+     (define field (hash-ref (Struct-Type-fields (hash-ref (Environment-structs env) type)) id))
+     (add-LLVM! cur-block (Get-Elm-Ptr-Instr type pointer (Field-index field) first-target))
+     first-target]
+    [else (error 'add-selector-LLVM! "Unsupported behavior - ~e is an invalid left expression of an assignment operation." target)]))
+
 ;; complete the phis of the given block in the process of sealing it
-(define (complete-phis! [instructions : (Listof LLVM-Instr)] [cur-block : Block]) : Void
+(define (complete-phis! [instructions : (Listof LLVM-Instr)] [cur-block : Block]) : Void     
   (cond
     [(and (not (empty? instructions)) (Phi-Instr? (first instructions)))
      (match (first instructions)
@@ -631,8 +659,8 @@
              (set! counter (+ 1 counter))
              (define phi (Phi-Instr var type '() target #t #f))
              (set-Block-LLVM! cur-block (cons phi (Block-LLVM cur-block)))
-             (add-phi-operands! phi cur-block predecessors)
              (write-variable! var target cur-block)
+             (add-phi-operands! phi cur-block predecessors)
              (Phi-Value target (Block-label cur-block))])]))
 
 ;; add the variable to the list of definitions - if it is already defined, redefine it
@@ -659,6 +687,12 @@
           (trivial-phi? (rest operands))
           #f)))
 
+;; get the size of a struct based on its fields for calls to malloc (for now, assume each field requires 32 bits)
+(define (get-struct-size [fields : (Listof (cons Symbol Field))]) : Integer
+  (if (empty? fields)
+      0
+      (+ 4 (get-struct-size (rest fields)))))
+
 ;; check if the first operand in a list is the same as all the rest
 (define (first-operand-matches-rest? [first-op : Operand] [rest-ops : (Listof Operand)]) : Boolean
   (if (empty? rest-ops)
@@ -670,7 +704,9 @@
 ;; creates the struct instructions (struct definitions)
 (define (create-struct-instrs [structs : Struct-Environment]) : (Listof Struct-Instr)
   (map (lambda ([struct : (cons Symbol Struct-Type)])
-         (Struct-Instr (car struct) (map Field-type (hash-values (Struct-Type-fields (cdr struct))))))
+         (Struct-Instr (car struct) (map (lambda ([field : (cons Symbol Field)])
+                                           (Field-type (cdr field)))
+                                         (sort (hash->list (Struct-Type-fields (cdr struct))) field<))))
        (sort (hash->list structs) struct<)))
 
 ;; creates the global instructions (declarations of global variables)
@@ -807,8 +843,12 @@
 (define (block->string [cur-block : Block] [entry-block? : Boolean]) : String
   (match cur-block
     [(Block label LLVM _ _ _ _ _)
-     (string-append (if entry-block? "" (string-append (number->string label) ":\n"))
-                    (LLVMs->string LLVM) "\n")]))
+     (if (empty? LLVM)
+         ""
+         (string-append (if entry-block?
+                            ""
+                            (string-append (number->string label) ":\n"))
+                        (LLVMs->string LLVM) "\n"))]))
 
 ;; converts a list of LLVM instructions to their string representations
 (define (LLVMs->string [LLVMs : (Listof LLVM-Instr)]) : String
@@ -837,14 +877,16 @@
                     from " " (operand->string operand) " to " to "\n")]
     [(Get-Elm-Ptr-Instr type pointer field-offset target)
      (string-append "  " (operand->string target) " = getelementptr " (type->string type (Levels-Indirection 0 0))
-                    ", " (type->string type (Levels-Indirection 0 1)) " " (operand->string pointer) ", i1 0, i32 "
+                    ", " (type->string type (Levels-Indirection 0 1)) " " (operand->string pointer) ", i32 0, i32 "
                     (number->string field-offset) "\n")]
     [(Call-Instr func-name return-type arg-types args target)
      (string-append "  " (operand->string target) " = call " (type->string return-type (Levels-Indirection 0 1))
                     " " (operand->string func-name) "(" (get-arguments-string arg-types args)
                     ")\n")]
-    [(Malloc-Instr target)
-     (string-append "  " (operand->string target) " = call i8* @malloc (i64 8)\n")]
+    [(Call-Void-Instr func-name arg-types args)
+     (string-append "  call void " (operand->string func-name) "(" (get-arguments-string arg-types args) ")\n")]
+    [(Malloc-Instr target size)
+     (string-append "  " (operand->string target) " = call i8* @malloc (i64 " (number->string size) ")\n")]
     [(Free-Instr target)
      (string-append "  call void @free(i8* " (operand->string target) ")\n")]
     [(Load-Instr type source target indir)
@@ -1075,11 +1117,30 @@
 (define (struct< [struct1 : (cons Symbol Struct-Type)] [struct2 : (cons Symbol Struct-Type)]) : Boolean
   (< (Struct-Type-index (cdr struct1)) (Struct-Type-index (cdr struct2))))
 
+;; defines the inequality used to sort fields in the field environment hash table (used to preserve field definition order)
+(define (field< [field1 : (cons Symbol Field)] [field2 : (cons Symbol Field)]) : Boolean
+  (< (Field-index (cdr field1)) (Field-index (cdr field2))))
+
 ;; set compiler mode from string
 (define (set-compiler-mode! [flag : String]) : Void
   (set! mode (cond
                [(equal? flag "-stack") 'stack]
                [(equal? flag "-registers") 'registers]
                [else (error 'set-compiler-mode "Compiler mode ~e does not exist. Supported modes: \"-stack\" and \"-registers\"" flag)])))
+
+;; is this instruction a control flow instruction?
+(define (control-flow-instr? [instruction : LLVM-Instr]) : Boolean
+  (or (Cond-Branch-Instr? instruction) (Branch-Instr? instruction) (Return-Expr-Instr? instruction) (Return-Void-Instr? instruction)))
+
+;; add "ret void" instructions at the end of every block in a void function without an existing control flow statement
+(define (add-return-voids! [cur-block : Block] [exit-block : Block] [visited : Block-Table]) : Void
+  (hash-set! visited (Block-label cur-block) cur-block)
+  (cond [(or (empty? (Block-LLVM cur-block)) (not (control-flow-instr? (last (Block-LLVM cur-block)))))
+         (add-LLVM! cur-block (Branch-Instr exit-block))])
+  (for-each (lambda ([unvisited-block : Block])
+              (add-return-voids! unvisited-block exit-block visited))
+            (filter (lambda ([block : Block])
+                      (not (hash-has-key? visited (Block-label block))))
+                    (Block-successors cur-block))))
 
 ;(test-compiler "../mile1/sample_json/simple.json")

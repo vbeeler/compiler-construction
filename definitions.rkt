@@ -91,7 +91,7 @@
 ;; LLVM INSTRUCTIONS
 
 (define-type LLVM-Instr (U Alloca-Instr Arith-Instr Bool-Instr Comp-Instr Size-Instr Get-Elm-Ptr-Instr
-                           Call-Instr Malloc-Instr Free-Instr Load-Instr Store-Instr Print-Instr Scan-Instr
+                           Call-Instr Call-Void-Instr Malloc-Instr Free-Instr Load-Instr Store-Instr Print-Instr Scan-Instr
                            Branch-Instr Cond-Branch-Instr Return-Expr-Instr Return-Void-Instr Phi-Instr Move-Instr))
 (struct Alloca-Instr ([type : Type] [target : Target]) #:transparent)
 (struct Arith-Instr ([operator : Arith-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
@@ -100,7 +100,8 @@
 (struct Size-Instr ([operator : Size-Operator] [operand : Operand] [from-type : String] [to-type : String] [target : Target]) #:transparent)
 (struct Get-Elm-Ptr-Instr ([type : Symbol] [pointer : Operand] [field-offset : Integer] [target : Target]) #:transparent)
 (struct Call-Instr ([func-name : Operand] [return-type : Type] [arg-types : (Listof Type)] [args : (Listof Operand)] [target : Target]) #:transparent)
-(struct Malloc-Instr ([target : Target]) #:transparent)
+(struct Call-Void-Instr ([func-name : Operand] [arg-types : (Listof Type)] [args : (Listof Operand)]) #:transparent)
+(struct Malloc-Instr ([target : Target] [size : Integer]) #:transparent)
 (struct Free-Instr ([target : Target]) #:transparent)
 (struct Load-Instr ([type : Type] [source : Operand] [target : Target] [indirection : Integer]) #:transparent)
 (struct Store-Instr ([type : Type] [source : Operand] [target : Operand] [indirection : Integer]) #:transparent)
