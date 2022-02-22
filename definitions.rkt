@@ -75,9 +75,17 @@
 
 ;; Control Flow Graph (CFG)
 
-(struct CFG ([func-name : Symbol] [parameters : (Listof Declaration)] [return-type : Return-Type] [blocks : Block-Table]) #:transparent) 
+(struct CFG ([func-name : Symbol]
+             [parameters : (Listof Declaration)]
+             [return-type : Return-Type]
+             [blocks : Block-Table]
+             [stack : Stack-Table]
+             [data : Data-Table]
+             [alloc-size : Integer])
+  #:transparent #:mutable) 
 (struct Block ([label : Integer]
                [LLVM : (Listof LLVM-Instr)]
+               [ARM : (Listof ARM-Instr)]
                [definitions : Definition-Table]
                [predecessors : (Listof Block)]
                [successors : (Listof Block)]
@@ -87,36 +95,39 @@
 (define-type Block-Label (U Integer 'entry-block 'exit-block))
 (define-type Block-Table (Mutable-HashTable Block-Label Block))
 (define-type Definition-Table (Mutable-HashTable Symbol Operand))
+(define-type Stack-Table (Mutable-HashTable Local Integer))
+(define-type Data-Table (Mutable-HashTable Global Data-Entry))
+(struct Data-Entry ([register : Register] [index : Integer]) #:transparent)
 
 ;; LLVM INSTRUCTIONS
 
-(define-type LLVM-Instr (U Alloca-Instr Arith-Instr Bool-Instr Comp-Instr Size-Instr Get-Elm-Ptr-Instr
-                           Call-Instr Call-Void-Instr Malloc-Instr Free-Instr Load-Instr Store-Instr Print-Instr Scan-Instr
-                           Branch-Instr Cond-Branch-Instr Return-Expr-Instr Return-Void-Instr Phi-Instr Move-Instr))
-(struct Alloca-Instr ([type : Type] [target : Target]) #:transparent)
-(struct Arith-Instr ([operator : Arith-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
-(struct Bool-Instr ([operator : Bool-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
-(struct Comp-Instr ([operator : Comp-Operator] [type : Type] [left : Operand] [right : Operand] [target : Target]) #:transparent)
-(struct Size-Instr ([operator : Size-Operator] [operand : Operand] [from-type : String] [to-type : String] [target : Target]) #:transparent)
-(struct Get-Elm-Ptr-Instr ([type : Symbol] [pointer : Operand] [field-offset : Integer] [target : Target]) #:transparent)
-(struct Call-Instr ([func-name : Operand] [return-type : Type] [arg-types : (Listof Type)] [args : (Listof Operand)] [target : Target]) #:transparent)
-(struct Call-Void-Instr ([func-name : Operand] [arg-types : (Listof Type)] [args : (Listof Operand)]) #:transparent)
-(struct Malloc-Instr ([target : Target] [size : Integer]) #:transparent)
-(struct Free-Instr ([target : Target]) #:transparent)
-(struct Load-Instr ([type : Type] [source : Operand] [target : Target] [indirection : Integer]) #:transparent)
-(struct Store-Instr ([type : Type] [source : Operand] [target : Operand] [indirection : Integer]) #:transparent)
-(struct Print-Instr ([operand : Operand] [endl : Boolean] [target : Target]) #:transparent)
-(struct Scan-Instr ([var : Operand] [result : Target]) #:transparent)
-(define-type Branch (U Branch-Instr Cond-Branch-Instr))
-(struct Branch-Instr ([block : Block]) #:transparent)
-(struct Cond-Branch-Instr ([cond : Operand] [true : Block] [false : Block]) #:transparent)
-(struct Return-Expr-Instr ([type : Type] [expr : Operand]) #:transparent)
-(struct Return-Void-Instr [] #:transparent)
-(struct Phi-Instr ([var : Symbol] [type : Type] [values : (Listof Phi-Value)] [target : Operand] [complete : Boolean] [removed : Boolean]) #:transparent #:mutable)
-(struct Move-Instr ([target : Operand] [source : Operand]) #:transparent)
+(define-type LLVM-Instr (U Alloca-LLVM Arith-LLVM Bool-LLVM Comp-LLVM Size-LLVM Get-Elm-Ptr-LLVM
+                           Call-LLVM Call-Void-LLVM Malloc-LLVM Free-LLVM Load-LLVM Store-LLVM Print-LLVM Scan-LLVM
+                           Branch-LLVM Cond-Branch-LLVM Return-Expr-LLVM Return-Void-LLVM Phi-LLVM Move-LLVM))
+(struct Alloca-LLVM ([type : Type] [target : Target]) #:transparent)
+(struct Arith-LLVM ([operator : Arith-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Bool-LLVM ([operator : Bool-Operator] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Comp-LLVM ([operator : Comp-Operator] [type : Type] [left : Operand] [right : Operand] [target : Target]) #:transparent)
+(struct Size-LLVM ([operator : Size-Operator] [operand : Operand] [from-type : String] [to-type : String] [target : Target]) #:transparent)
+(struct Get-Elm-Ptr-LLVM ([type : Symbol] [pointer : Operand] [field-offset : Integer] [target : Target]) #:transparent)
+(struct Call-LLVM ([func-name : Global] [return-type : Type] [arg-types : (Listof Type)] [args : (Listof Operand)] [target : Target]) #:transparent)
+(struct Call-Void-LLVM ([func-name : Global] [arg-types : (Listof Type)] [args : (Listof Operand)]) #:transparent)
+(struct Malloc-LLVM ([target : Target] [size : Integer]) #:transparent)
+(struct Free-LLVM ([target : Target]) #:transparent)
+(struct Load-LLVM ([type : Type] [source : Operand] [target : Target] [indirection : Integer]) #:transparent)
+(struct Store-LLVM ([type : Type] [source : Operand] [target : Operand] [indirection : Integer]) #:transparent)
+(struct Print-LLVM ([operand : Operand] [endl : Boolean] [target : Target]) #:transparent)
+(struct Scan-LLVM ([var : Operand] [result : Target]) #:transparent)
+(define-type Branch (U Branch-LLVM Cond-Branch-LLVM))
+(struct Branch-LLVM ([block : Block]) #:transparent)
+(struct Cond-Branch-LLVM ([cond : Operand] [true : Block] [false : Block]) #:transparent)
+(struct Return-Expr-LLVM ([type : Type] [expr : Operand]) #:transparent)
+(struct Return-Void-LLVM [] #:transparent)
+(struct Phi-LLVM ([var : Symbol] [type : Type] [values : (Listof Phi-Value)] [target : Operand] [complete : Boolean]) #:transparent #:mutable)
+(struct Move-LLVM ([target : Operand] [source : Operand]) #:transparent)
 
 ;; LLVM operators
-(define-type Operator (U Arith-Operator Bool-Operator Comp-Operator Size-Operator))
+(define-type LLVM-Operator (U Arith-Operator Bool-Operator Comp-Operator Size-Operator))
 (define-type Arith-Operator (U '+ '- '* '/))
 (define-type Bool-Operator (U '|| '&& '^^))
 (define-type Comp-Operator (U '== '!= '< '> '<= '>=))
@@ -129,7 +140,8 @@
 (struct Global ([id : Symbol]) #:transparent)
 (struct Intermediate ([num : Integer]) #:transparent)
 (struct Register ([num : Integer]) #:transparent)
-(define-type Operand (U Literal Local Global Intermediate Register Block))
+(struct Special-Register ([name : Symbol]) #:transparent)
+(define-type Operand (U Literal Local Global Intermediate Register Block Special-Register))
 (define-type Target (U Local Global Intermediate Register))
 (struct C-Lib-Funcs ([malloc : Boolean]
                      [free : Boolean]
@@ -142,13 +154,47 @@
 (struct Phi-Value ([operand : Operand] [block-label : Integer]) #:transparent)
 
 ;; LLVM Program
-(struct Struct-Instr ([name : Symbol] [fields : (Listof Type)]) #:transparent)
-(struct Global-Instr ([name : Symbol] [type : Type]) #:transparent)
-(struct LLVM-Program ([structs : (Listof Struct-Instr)]
-                      [globals : (Listof Global-Instr)]
+(struct Struct-LLVM ([name : Symbol] [fields : (Listof Type)]) #:transparent)
+(struct Global-LLVM ([name : Symbol] [type : Type]) #:transparent)
+(struct LLVM-Program ([structs : (Listof Struct-LLVM)]
+                      [globals : (Listof Global-LLVM)]
                       [func-CFGs : (Listof CFG)]
                       [c-lib-funcs : C-Lib-Funcs])
   #:transparent)
 
 ;; Compiler Specifications/Information
 (define-type Compiler-Mode (U 'stack 'registers))
+(define-type Output-Type (U 'LLVM 'asssembly))
+
+;; ARM INSTRUCTIONS
+
+(define-type ARM-Instr (U Arith-ARM Bool-ARM Move-ARM Branch-Label-ARM Comp-ARM Move-Cond-ARM Move-Word-ARM
+                          Move-Word-Lower-ARM Move-Word-Constant-ARM Move-Top-ARM Move-Top-Constant-ARM Load-Reg-ARM Load-Data-ARM
+                          Load-Stack-ARM Store-Reg-ARM Store-Stack-ARM Branch-Equal-ARM Branch-ARM))
+(struct Arith-ARM ([operator : Arith-Operator-ARM] [target : Operand] [left : Operand] [right : Operand]) #:transparent #:mutable)
+(struct Bool-ARM ([operator : Bool-Operator] [target : Target] [left : Operand] [right : Operand]) #:transparent)
+(struct Move-ARM ([target : Operand] [source : Operand]) #:transparent)
+(struct Branch-Label-ARM ([label : Symbol]) #:transparent)
+(struct Comp-ARM ([left : Operand] [right : Operand]) #:transparent)
+(struct Move-Cond-ARM ([operator : Comp-Operator] [target : Operand] [source : Operand]) #:transparent)
+(struct Move-Word-ARM ([target : Operand] [source : Operand]) #:transparent)
+(struct Move-Word-Lower-ARM ([target : Operand] [source : Integer]) #:transparent)
+(struct Move-Word-Constant-ARM ([target : Operand] [constant : Symbol]) #:transparent)
+(struct Move-Top-ARM ([target : Operand] [source : Integer]) #:transparent)
+(struct Move-Top-Constant-ARM ([target : Operand] [constant : Symbol]) #:transparent)
+(struct Load-Reg-ARM ([target : Operand] [source : Operand]) #:transparent)
+(struct Load-Data-ARM ([target : Operand] [data-index : Integer]) #:transparent)
+(struct Load-Stack-ARM ([target : Operand] [stack-offset : Integer]) #:transparent)
+(struct Store-Reg-ARM ([source : Operand] [target : Operand]) #:transparent)
+(struct Store-Stack-ARM ([source : Operand] [stack-offset : Integer]) #:transparent)
+(struct Branch-Equal-ARM ([block-label : Integer]) #:transparent)
+(struct Branch-ARM ([block-label : Integer]) #:transparent)
+
+(define-type ARM-Operator (U Arith-Operator-ARM Bool-Operator Comp-Operator))
+(define-type Arith-Operator-ARM (U '+ '- '*))
+(struct Lib-Funcs ([c-lib-funcs : C-Lib-Funcs] [division : Boolean]) #:transparent #:mutable)
+(struct Global-ARM ([id : Symbol] [size : Integer]) #:transparent)
+(struct ARM-Program ([global-decs : (Listof Global-ARM)]
+                     [func-CFGs : (Listof CFG)]
+                     [lib-funcs : Lib-Funcs])
+  #:transparent)

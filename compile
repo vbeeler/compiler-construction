@@ -1,11 +1,37 @@
 #!/bin/sh
 
-for mini in "${@:2}"
-do    
-   out="$(basename $mini)"
-   echo "; ModuleID = '$out'" > ${mini%.*}.ll
-   echo "source_filename = \"$out\"" >> ${mini%.*}.ll
-   echo "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"" >> ${mini%.*}.ll
-   echo "target triple = \"x86_64-apple-macosx10.15.0\"" >> ${mini%.*}.ll
-   racket compile.rkt "$1" $(java -jar ../mile1/given/MiniCompiler.jar $mini) >> ${mini%.*}.ll
+MINI_NAME=""
+OUT_FILENAME=""
+COMPILER_MODE="registers"
+OUTPUT_TYPE="assembly"
+
+for arg in "$@"
+do
+   case $arg in
+      -stack)
+         COMPILER_MODE="stack"
+         shift
+         ;;
+      -llvm)
+         OUTPUT_TYPE="LLVM"
+         shift
+         ;;
+      *)
+         MINI_NAME="$1"
+         shift
+         ;;
+   esac
 done
+
+if [ -z "$MINI_NAME" ]
+then
+   echo "You must specify the name of a .mini program to compile."
+   exit 1
+fi
+
+case $OUTPUT_TYPE in
+   assembly) OUT_FILENAME=${MINI_NAME%.*}.s ;;
+   LLVM) OUT_FILENAME=${MINI_NAME%.*}.ll ;;
+esac
+
+racket compile.rkt $(java -jar MiniCompiler.jar $MINI_NAME) $COMPILER_MODE $OUTPUT_TYPE $(basename MINI_NAME) > $OUT_FILENAME
