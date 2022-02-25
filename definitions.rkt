@@ -90,7 +90,8 @@
                [predecessors : (Listof Block)]
                [successors : (Listof Block)]
                [reachable : Boolean]
-               [sealed : Boolean])
+               [sealed : Boolean]
+               [add-temp-moves : (Listof Move-ARM)])
   #:transparent #:mutable)
 (define-type Block-Label (U Integer 'entry-block 'exit-block))
 (define-type Block-Table (Mutable-HashTable Block-Label Block))

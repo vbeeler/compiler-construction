@@ -34,4 +34,4 @@ case $OUTPUT_TYPE in
    LLVM) OUT_FILENAME=${MINI_NAME%.*}.ll ;;
 esac
 
-racket compile.rkt $(java -jar MiniCompiler.jar $MINI_NAME) $COMPILER_MODE $OUTPUT_TYPE $(basename MINI_NAME) > $OUT_FILENAME
+racket compile.rkt $(java -jar MiniCompiler.jar $MINI_NAME) $COMPILER_MODE $OUTPUT_TYPE $(basename $MINI_NAME) > $OUT_FILENAME

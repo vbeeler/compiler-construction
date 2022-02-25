@@ -94,7 +94,7 @@
   (check-valid-main (Environment-functions environment))
   (define LLVM-Program (create-LLVM (Program-functions AST) environment))
   (define ARM-Program (LLVM-Program->ARM-Program LLVM-Program environment))
-  (ARM-Program->string ARM-Program))
+  (ARM-Program->string ARM-Program json-file))
 
 ;; the compiler (takes in the json representation of the program) - this is the method that ./compile uses
 (define (compile-json [json-str : String] [compiler-mode : String] [output-type : String] [source-filename : String]) : String
@@ -104,7 +104,7 @@
   (define LLVM-Program (create-LLVM (Program-functions AST) environment))
   (cond
     [(equal? output-type "LLVM") (LLVM-Program->string LLVM-Program source-filename)]
-    [(equal? output-type "assembly") (ARM-Program->string (LLVM-Program->ARM-Program LLVM-Program environment))]
+    [(equal? output-type "assembly") (ARM-Program->string (LLVM-Program->ARM-Program LLVM-Program environment) source-filename)]
     [else (error 'compile-json "Unsupported output type: ~e")]))
 
 ;; the compiler (takes in the name of the json file) - kept for unit tests
@@ -361,6 +361,7 @@
 ;; MILESTONE 2 FUNCTIONS
 
 (define counter 1)
+(define entry-block-label 0)
 (define mode : Compiler-Mode 'registers)
 (define c-lib-funcs (C-Lib-Funcs #f #f #f #f #f))
 (define lib-funcs (Lib-Funcs c-lib-funcs #f))
@@ -377,7 +378,7 @@
   (match function
     [(Function name parameters return-type declarations statements)
      (define entry-block (initialize-entry-block return-type parameters declarations))
-     (define exit-block (Block -1 '() '() (make-hash '()) '() '() #f #f))
+     (define exit-block (Block -1 '() '() (make-hash '()) '() '() #f #f '()))
      (define blocks 
        (ann (make-hash
              (list (cons 'entry-block entry-block)
@@ -572,11 +573,9 @@
           [(hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) target)
            (define first-target (get-target))
            (define second-target (get-target))
-           (define third-target (get-target))
-           (add-LLVMs! cur-block (list (Alloca-LLVM 'int first-target)
-                                       (Scan-LLVM first-target second-target)
-                                       (Load-LLVM 'int first-target third-target 0)))
-           (write-variable! target third-target cur-block)]
+           (add-LLVMs! cur-block (list (Scan-LLVM (Global '.read_scratch) first-target)
+                                       (Load-LLVM 'int (Global '.read_scratch) second-target 0)))
+           (write-variable! target second-target cur-block)]
           [else (add-LLVM! cur-block (Scan-LLVM (Global target) (get-target)))])]
        [else (add-LLVM! cur-block (Scan-LLVM (add-selector-LLVM! target cur-block env func-name) (get-target)))])]
     [else (error 'add-read-LLVM! "Unsupported compiler mode: ~e" mode)]))
@@ -618,7 +617,11 @@
                          (if (hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) left)
                              (block
                               (define target (get-target))
-                              (add-LLVM! cur-block (Load-LLVM type (Local left) target 1))
+                              (define source (cond
+                                               [(equal? mode 'stack) (Local left)]
+                                               [(equal? mode 'registers) (Phi-Value-operand (read-variable left type cur-block))]
+                                               [else (error 'add-selector-LLVM "Unsupported compiler mode ~e" mode)]))
+                              (add-LLVM! cur-block (Load-LLVM type source target 1))
                               target)
                              (Global left))
                          (add-expression-LLVM! left cur-block env func-name)))
@@ -648,11 +651,10 @@
 ;; get the value of the variable in the current block (may need to look at its predecessors and add phi nodes)
 (define (read-variable [var : Symbol] [type : Type] [cur-block : Block]) : Phi-Value
   (match cur-block
-    [(Block _ _ _ definitions predecessors _ _ sealed)
+    [(Block _ _ _ definitions predecessors _ _ sealed _)
      (cond
        [(hash-has-key? definitions var) (Phi-Value (hash-ref definitions var) (Block-label cur-block))]
-       [(not sealed) (define target (Register counter))
-                     (set! counter (+ 1 counter))
+       [(not sealed) (define target (get-target))
                      (set-Block-LLVM! cur-block (cons (Phi-LLVM var type '() target #f) (Block-LLVM cur-block)))
                      (write-variable! var target cur-block)
                      (Phi-Value target (Block-label cur-block))]
@@ -660,8 +662,7 @@
        [(equal? (length predecessors) 1) (define value (read-variable var type (first predecessors)))
                                          (write-variable! var (Phi-Value-operand value) cur-block)
                                          value]
-       [else (define target (Register counter))
-             (set! counter (+ 1 counter))
+       [else (define target (get-target))
              (define phi (Phi-LLVM var type '() target #t))
              (set-Block-LLVM! cur-block (cons phi (Block-LLVM cur-block)))
              (write-variable! var target cur-block)
@@ -762,7 +763,7 @@
 ;; generate dot code for a label
 (define (generate-label [cur-block : Block]) : String
   (match cur-block
-    [(Block label LLVM _ definitions _ _ reachable _)
+    [(Block label LLVM _ definitions _ _ reachable _ _)
      (if reachable
          (string-append (number->string label) "[ label = \"" (number->string label) "\n" (LLVMs->string LLVM)
                         "\", xlabel = \"" (apply string-append (map definition->string (hash->list definitions))) "\"]\n")
@@ -771,7 +772,7 @@
 ;; generate dot code for an edge
 (define (generate-edge [cur-block : Block]) : String
   (match cur-block
-    [(Block label _ _ _ _ successors _ _)
+    [(Block label _ _ _ _ successors _ _ _)
      (if (empty? successors)
          ""
          (apply string-append (map (lambda ([successor-label : Integer])
@@ -819,7 +820,8 @@
      (cond [printf-space
             (set! code (string-append code "@.str.print.space = private unnamed_addr constant [4 x i8] c\"%d \\00\", align 1\n"))])
      (cond [scanf
-            (set! code (string-append code "@.str.read = private unnamed_addr constant [3 x i8] c\"%d\\00\", align 1\n"))])
+            (set! code (string-append code "@.str.read = private unnamed_addr constant [3 x i8] c\"%d\\00\", align 1\n"
+                                      "@.read_scratch = common global i32 0, align 4\n"))])
      code]))
 
 ;; converts a list of global instructions to their string representations
@@ -861,7 +863,7 @@
 ;; converts a block to its string representation
 (define (block->string [cur-block : Block] [entry-block? : Boolean]) : String
   (match cur-block
-    [(Block label LLVM _ _ _ _ _ _)
+    [(Block label LLVM _ _ _ _ _ _ _)
      (if (empty? LLVM)
          ""
          (string-append (if entry-block?
@@ -966,7 +968,7 @@
     [(Local id) (string-append "%" (symbol->string id))]
     [(Global id) (string-append "@" (symbol->string id))]
     [(Intermediate value) (string-append "%" (number->string value))]
-    [(Block label _ _ _ _ _ _ _) (string-append "%" (number->string label))]
+    [(Block label _ _ _ _ _ _ _ _) (string-append "%" (number->string label))]
     [(Register num) (string-append "%" (number->string num))]
     [Literal (literal->string operand)]))
 
@@ -1048,7 +1050,7 @@
 ;; this entails allocating declarations and storing parameter values on the stack
 (define (initialize-entry-block [return-type : Return-Type] [parameters : (Listof Declaration)] [declarations : (Listof Declaration)]) : Block
   (set! counter 0)
-  (define entry-block (Block -1 '() '() (make-hash '()) '() '() #t #t))
+  (define entry-block (Block -1 '() '() (make-hash '()) '() '() #t #t '()))
   (cond
     [(equal? mode 'stack)
      (cond [(not (equal? return-type 'void))
@@ -1057,11 +1059,11 @@
      (store-parameters entry-block parameters)]
     [(equal? mode 'registers)
      (map (lambda ([var : Symbol])
-            (write-variable! var (Register counter) entry-block)
-            (set! counter (+ 1 counter)))
+            (write-variable! var (get-target) entry-block))
           (map Declaration-id parameters))]
     [else (error 'initialize-entry-block "Unsupported compiler mode ~e:" mode)])
   (set-Block-label! entry-block counter)
+  (set! entry-block-label counter)
   (set! counter (+ 1 counter))
   entry-block)
 
@@ -1099,7 +1101,7 @@
 
 ;; creates a block and puts it in the hash table
 (define (create-block [predecessors : (Listof Block)] [sealed : Boolean] [blocks : Block-Table]) : Block
-  (define cur-block (Block counter '() '() (make-hash '()) predecessors '() #t sealed))
+  (define cur-block (Block counter '() '() (make-hash '()) predecessors '() #t sealed '()))
   (map (lambda ([pred : Block]) (set-Block-successors! pred (cons cur-block (Block-successors pred)))) predecessors)
   (hash-set! blocks counter cur-block)
   (set! counter (+ 1 counter))
@@ -1107,10 +1109,7 @@
 
 ;; gets the target for an expression
 (define (get-target) : Target
-  (define target : Target (Intermediate -1))
-  (cond
-    [(equal? mode 'stack) (set! target (Intermediate counter))]
-    [(equal? mode 'registers) (set! target (Register counter))])
+  (define target (Intermediate counter))
   (set! counter (+ 1 counter))
   target)
 
@@ -1202,102 +1201,109 @@
 
 ;; convert an LLVM instruction to ARM code
 (define (LLVM->ARM [LLVM : LLVM-Instr] [cur-block : Block] [blocks : Block-Table] [cfg : CFG]) : Void
-  (match LLVM
-    [(Alloca-LLVM type target)
-     (error 'LLVM->ARM "All alloca instructions should occur at the beginning of the function.")]
-    [(Arith-LLVM operator left right target)
-     (if (not (equal? operator '/))
-         (add-ARM! cur-block (Arith-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))
-         (block
-          (set-Lib-Funcs-division! lib-funcs #t)
-          (add-ARMs! cur-block (list (Move-ARM (Register 0) (get-arm-operand! left cur-block cfg))
-                                     (Move-ARM (Register 1) (get-arm-operand! right cur-block cfg))
-                                     (Branch-Label-ARM 'aeabi_idiv)
-                                     (Move-ARM target (Register 0))))))]
-    [(Bool-LLVM operator left right target)
-     (add-ARM! cur-block (Bool-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))]
-    [(Comp-LLVM operator type left right target)
-     (add-ARMs! cur-block (list (Move-ARM target 0)
-                                (Comp-ARM (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg))
-                                (Move-Cond-ARM operator target 1)))]
-    [(Size-LLVM operator operand from to target)
-     (cond
-       [(equal? operator 'bitcast)
-        (add-ARM! cur-block (Move-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! operand cur-block cfg)))]
-       [else (error 'LLVM->ARM "Unsupported operator - not yet implemented.")])]
-    [(Get-Elm-Ptr-LLVM type pointer field-offset target)
-     (add-ARM! cur-block (Arith-ARM '+ target (get-arm-operand! pointer cur-block cfg) (* field-offset 4)))]
-    [(Call-LLVM func-name _ _ args target)
-     (define arg-num 0)
-     (for-each (lambda ([arg : Operand])
-                 (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
-                 (set! arg-num (+ 1 arg-num)))
-               args)
-     (add-ARMs! cur-block (list (Branch-Label-ARM (Global-id func-name))
-                                (Move-ARM target (Register 0))))]
-    [(Call-Void-LLVM func-name arg-types args)
-     (define arg-num 0)
-     (for-each (lambda ([arg : Operand])
-                 (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
-                 (set! arg-num (+ 1 arg-num)))
-               args)
-     (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name)))]
-    [(Malloc-LLVM target size)
-     (add-ARMs! cur-block (list (Move-Word-ARM (Register 0) size)
-                                (Branch-Label-ARM 'malloc)
-                                (Move-ARM target (Register 0))))]
-    [(Free-LLVM target)
-     (add-ARMs! cur-block (list (Move-ARM (Register 0) target)
-                                (Branch-Label-ARM 'free)))]
-    [(Load-LLVM _ source target _)
-     (if (Local? source)
-         (add-ARM! cur-block (Load-Stack-ARM (get-arm-operand! target cur-block cfg)
-                                             (if (hash-has-key? (CFG-stack cfg) source)
-                                                 (hash-ref (CFG-stack cfg) source)
-                                                 (error 'LLVM->ARM "Local variable ~e is used undefined" (Local-id source)))))
-         (add-ARM! cur-block (Load-Reg-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg))))]
-    [(Store-LLVM type source target indir)
-     (define source-operand
-       (if (integer? source)
-           (block
-            (define target (get-register))
-            (add-ARM! cur-block (Move-ARM target source))
-            target)
-           (get-arm-operand! source cur-block cfg)))
-     (if (Local? target)
-         (add-ARM! cur-block (Store-Stack-ARM source-operand (get-stack-offset cur-block target cfg)))
-         (add-ARM! cur-block (Store-Reg-ARM source-operand (get-arm-operand! target cur-block cfg))))]
-    [(Print-LLVM operand endl target)
-     (add-ARMs! cur-block (list (Move-ARM (Register 1) (get-arm-operand! operand cur-block cfg))
-                                (Move-Word-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
-                                (Move-Top-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
-                                (Branch-Label-ARM 'printf)))]
-    [(Scan-LLVM target result)
-     (add-ARMs! cur-block (list (Move-Word-Constant-ARM (Register 1) '.read_scratch)
-                                (Move-Top-Constant-ARM (Register 1) '.read_scratch)
-                                (Move-Word-Constant-ARM (Register 0) '.READ_FMT)
-                                (Move-Top-Constant-ARM (Register 0) '.READ_FMT)
-                                (Branch-Label-ARM 'scanf)))
-     (define target-operand (get-arm-operand! target cur-block cfg))
-     (add-ARMs! cur-block (list (Move-Word-Constant-ARM target-operand '.read_scratch)
-                                (Move-Top-Constant-ARM target-operand '.read_scratch)
-                                (Load-Reg-ARM target-operand target-operand)))]
-    [(Branch-LLVM block)
-     (add-ARM! cur-block (Branch-ARM (Block-label block)))]
-    [(Cond-Branch-LLVM cond true false)
-     (add-ARMs! cur-block (list (Comp-ARM (get-arm-operand! cond cur-block cfg) 1)
-                                (Branch-Equal-ARM (Block-label true))
-                                (Branch-ARM (Block-label false))))]
-    [(Return-Expr-LLVM type expr)
-     (add-ARM! cur-block (Move-ARM (Register 0) (get-arm-operand! expr cur-block cfg)))]
-    [(Phi-LLVM _ _ values target _)
-     (for-each (lambda ([phi-val : Phi-Value])
-                 (define definition-block (hash-ref blocks (Phi-Value-block-label phi-val)))
-                 (insert-temp-move! target (Phi-Value-operand phi-val) definition-block '() (Block-ARM definition-block)))
-               values)]
-    [(Move-LLVM target source)
-     (add-ARM! cur-block (Move-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg)))]))
+  (cond [(not (Return-Void-LLVM? LLVM))
+         (match LLVM
+           [(Alloca-LLVM type target)
+            (error 'LLVM->ARM "All alloca instructions should occur at the beginning of the function.")]
+           [(Arith-LLVM operator left right target)
+            (if (not (equal? operator '/))
+                (add-ARM! cur-block (Arith-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))
+                (block
+                 (set-Lib-Funcs-division! lib-funcs #t)
+                 (add-ARMs! cur-block (list (Move-ARM (Register 0) (get-arm-operand! left cur-block cfg))
+                                            (Move-ARM (Register 1) (get-arm-operand! right cur-block cfg))
+                                            (Branch-Label-ARM 'aeabi_idiv)
+                                            (Move-ARM target (Register 0))))))]
+           [(Bool-LLVM operator left right target)
+            (add-ARM! cur-block (Bool-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))]
+           [(Comp-LLVM operator type left right target)
+            (add-ARMs! cur-block (list (Move-ARM target 0)
+                                       (Comp-ARM (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg))
+                                       (Move-Cond-ARM operator target 1)))]
+           [(Size-LLVM operator operand from to target)
+            (cond
+              [(equal? operator 'bitcast)
+               (add-ARM! cur-block (Move-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! operand cur-block cfg)))]
+              [else (error 'LLVM->ARM "Unsupported operator - not yet implemented.")])]
+           [(Get-Elm-Ptr-LLVM type pointer field-offset target)
+            (add-ARM! cur-block (Arith-ARM '+ target (get-arm-operand! pointer cur-block cfg) (* field-offset 4)))]
+           [(Call-LLVM func-name _ _ args target)
+            (define arg-num 0)
+            (for-each (lambda ([arg : Operand])
+                        (if (< arg-num 4)
+                            (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
+                            (place-arg-on-stack! arg arg-num cfg))
+                        (set! arg-num (+ 1 arg-num)))
+                      args)
+            (add-ARMs! cur-block (list (Branch-Label-ARM (Global-id func-name))
+                                       (Move-ARM target (Register 0))))]
+           [(Call-Void-LLVM func-name arg-types args)
+            (define arg-num 0)
+            (for-each (lambda ([arg : Operand])
+                        (if (< arg-num 4)
+                            (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
+                            (place-arg-on-stack! arg arg-num cfg))
+                        (set! arg-num (+ 1 arg-num)))
+                      args)
+            (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name)))]
+           [(Malloc-LLVM target size)
+            (add-ARMs! cur-block (list (Move-Word-ARM (Register 0) size)
+                                       (Branch-Label-ARM 'malloc)
+                                       (Move-ARM target (Register 0))))]
+           [(Free-LLVM target)
+            (add-ARMs! cur-block (list (Move-ARM (Register 0) target)
+                                       (Branch-Label-ARM 'free)))]
+           [(Load-LLVM _ source target _)
+            (if (Local? source)
+                (add-ARM! cur-block (Load-Stack-ARM (get-arm-operand! target cur-block cfg)
+                                                    (if (hash-has-key? (CFG-stack cfg) source)
+                                                        (hash-ref (CFG-stack cfg) source)
+                                                        (error 'LLVM->ARM "Local variable ~e is used undefined" (Local-id source)))))
+                (add-ARM! cur-block (Load-Reg-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg))))]
+           [(Store-LLVM type source target indir)
+            (define source-operand (get-reg-operand source cur-block cfg))
+            (if (Local? target)
+                (add-ARM! cur-block (Store-Stack-ARM source-operand (get-stack-offset cur-block target cfg)))
+                (add-ARM! cur-block (Store-Reg-ARM source-operand (get-arm-operand! target cur-block cfg))))]
+           [(Print-LLVM operand endl target)
+            (add-ARMs! cur-block (list (Move-ARM (Register 1) (get-arm-operand! operand cur-block cfg))
+                                       (Move-Word-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
+                                       (Move-Top-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
+                                       (Branch-Label-ARM 'printf)))]
+           [(Scan-LLVM target result)
+            (add-ARMs! cur-block (list (Move-Word-Constant-ARM (Register 1) '.read_scratch)
+                                       (Move-Top-Constant-ARM (Register 1) '.read_scratch)
+                                       (Move-Word-Constant-ARM (Register 0) '.READ_FMT)
+                                       (Move-Top-Constant-ARM (Register 0) '.READ_FMT)
+                                       (Branch-Label-ARM 'scanf)))
+            (define target-operand (get-arm-operand! target cur-block cfg))
+            (add-ARMs! cur-block (list (Move-Word-Constant-ARM target-operand '.read_scratch)
+                                       (Move-Top-Constant-ARM target-operand '.read_scratch)
+                                       (Load-Reg-ARM target-operand target-operand)))]
+           [(Branch-LLVM block)
+            (add-temp-moves! cur-block)
+            (add-ARM! cur-block (Branch-ARM (Block-label block)))]
+           [(Cond-Branch-LLVM cond true false)
+            (println (Block-ARM cur-block))
+            (add-temp-moves! cur-block)
+            (add-ARMs! cur-block (list (Comp-ARM (get-arm-operand! cond cur-block cfg) 1)
+                                       (Branch-Equal-ARM (Block-label true))
+                                       (Branch-ARM (Block-label false))))]
+           [(Return-Expr-LLVM type expr)
+            (add-ARM! cur-block (Move-ARM (Register 0) (get-arm-operand! expr cur-block cfg)))]
+           [(Phi-LLVM _ _ values target _)
+            (for-each (lambda ([phi-val : Phi-Value])
+                        (define def-label (Phi-Value-block-label phi-val))
+                        (define entry-block (hash-ref blocks 'entry-block))
+                        (define definition-block (if (equal? def-label (Block-label entry-block))
+                                                     entry-block
+                                                     (hash-ref blocks def-label)))
+                        (insert-temp-move! target (Phi-Value-operand phi-val) definition-block '() (Block-ARM definition-block)))
+                      values)]
+           [(Move-LLVM target source)
+            (add-ARM! cur-block (Move-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg)))])]))
 
+;; create the ARM move instruction to move the stack point based on the number of LLVM alloca instructions
 (define (move-stack-pointer! [LLVMs : (Listof LLVM-Instr)] [cur-block : Block] [alloc-size : Integer] [cfg : CFG]) : (Listof LLVM-Instr)
   (cond
     [(and (not (empty? LLVMs)) (Alloca-LLVM? (first LLVMs)))
@@ -1307,6 +1313,7 @@
      (set-CFG-alloc-size! cfg alloc-size)
      LLVMs]))
 
+;; get the stack offset for the given local variable (or place it on the stack if it's not already there)
 (define (get-stack-offset [cur-block : Block] [local : Local] [cfg : CFG]) : Integer
   (if (hash-has-key? (CFG-stack cfg) local)
       (hash-ref (CFG-stack cfg) local)
@@ -1316,22 +1323,43 @@
        (hash-set! (CFG-stack cfg) local stack-offset)
        stack-offset)))
 
+;; place an argument on the stack when the number of arguments exceeds 4
+(define (place-arg-on-stack! [arg : Operand] [arg-num : Integer] [cur-block : Block] [cfg : CFG]) : Void
+  (set-CFG-alloc-size! cfg (+ 4 (CFG-alloc-size cfg)))
+  (define stack-offset (* 4 (- arg-num 4)))
+  (add-ARM! cur-block (Store-Stack-ARM (get-reg-operand arg cur-block cfg) stack-offset)))
+
+;; get the register operand (needed for stores since you cannot store an integer or boolean directly into memory)
+(define (get-reg-operand [operand : Operand] [cur-block : Block] [cfg : CFG]) : Operand
+  (cond
+    [(or (integer? operand) (boolean? operand))
+     (define target (get-target))
+     (add-ARM! cur-block (Move-ARM target (get-arm-operand! operand cur-block cfg)))
+     target]
+    [else (get-arm-operand! operand cur-block cfg)]))
+
 ;; insert a move instruction to a temporary register to handle phi nodes from the LLVM code
 ;; since we are in SSA form, this move can happen anywhere in the definition block
 ;;    thus, put it as far toward the end of the block as possible to reduce register pressure
 (define (insert-temp-move! [temp : Operand] [value : Operand] [cur-block : Block] [prev-ARM : (Listof ARM-Instr)] [post-ARM : (Listof ARM-Instr)]) : Void
-  (if (not (empty? post-ARM))
-      (if (ARM-control-flow-instr? (first post-ARM))
-          (set-Block-ARM! cur-block (append prev-ARM (list (Move-ARM temp value)) post-ARM))
-          (insert-temp-move! temp value cur-block (append prev-ARM (list (first post-ARM))) (rest post-ARM)))
-      (error 'insert-temp-move! "Unsupported behavior - we reached the end of definition block ~e without a control flow instruction." (Block-label cur-block))))
+  (cond [(not (empty? post-ARM))
+         (if (ARM-branch-instr? (first post-ARM))
+             (set-Block-ARM! cur-block (append prev-ARM (list (Move-ARM temp value)) post-ARM))
+             (insert-temp-move! temp value cur-block (append prev-ARM (list (first post-ARM))) (rest post-ARM)))]
+        [else (set-Block-add-temp-moves! cur-block (cons (Move-ARM temp value) (Block-add-temp-moves cur-block)))]))
+
+;; add the temporary move instructions that were originally ignored until the block became filled
+(define (add-temp-moves! [cur-block : Block]) : Void
+  (add-ARMs! cur-block (Block-add-temp-moves cur-block))
+  (set-Block-add-temp-moves! cur-block '()))
 
 ;; convert an ARM-Program to its string representation
-(define (ARM-Program->string [ARM-Prog : ARM-Program]) : String
+(define (ARM-Program->string [ARM-Prog : ARM-Program] [source-filename : String]) : String
   (match ARM-Prog
     [(ARM-Program global-decs CFGs lib-funcs)
      (define func-counter 0)
-     (string-append (apply string-append (map (lambda ([cfg : CFG])
+     (string-append "   .text\n   .file \"" source-filename "\"\n"
+                    (apply string-append (map (lambda ([cfg : CFG])
                                                 (define func-idx func-counter)
                                                 (set! func-counter (+ 1 func-counter))
                                                 (ARM-CFG->string cfg func-idx))
@@ -1349,9 +1377,10 @@
                     "   .type " (symbol->string func-name) ",%function\n"
                     "   .code 32\n"
                     (symbol->string func-name) ":\n"
-                    "   .fnstart\n"
                     (if (not (equal? alloc-size 0))
-                        (string-append "   .pad #" (number->string alloc-size))
+                        (string-append "   push {r11, lr}\n"
+                                       "   mov r11, sp\n"
+                                       "   sub sp, sp, " (number->string alloc-size))
                         "")
                     (apply string-append (map (lambda ([ARM : ARM-Instr])
                                                 (ARM->string ARM func-idx))
@@ -1362,6 +1391,10 @@
                                                                                            (ARM->string ARM func-idx))
                                                                                          (Block-ARM cur-block)))))
                                               (rest sorted-blocks)))
+                    (if (not (equal? alloc-size 0))
+                        (string-append "   mov sp, r11\n"
+                                       "   push {r11, pc}\n")
+                        "   bx lr\n")
                     (apply string-append (map (lambda ([data-entry : (cons Global Data-Entry)])
                                                 (ARM-data->string data-entry func-idx))
                                               (sort (hash->list data) data<)))
@@ -1420,6 +1453,7 @@
      (string-append "   b " (ARM-label->string block-label func-idx) "\n")]))
 
 
+;; convert an ARM block label to a string
 (define (ARM-label->string [block-label : Integer] [func-idx : Integer]) : String
   (string-append ".LBB" (number->string func-idx) "_" (number->string block-label)))
 
@@ -1482,7 +1516,7 @@
     [(Local id) (error 'ARM-operand->string "Unsupported operand type in ARM code: LOCAL")]
     [(Global id) (error 'ARM-operand->string "Unsupported operand type in ARM code: GLOBAL")]
     [(Intermediate value) (string-append "r" (number->string value))]
-    [(Block _ _ _ _ _ _ _ _) (error 'ARM-operand->string "Unsupported operand type in ARM code: BLOCK")]
+    [(Block _ _ _ _ _ _ _ _ _) (error 'ARM-operand->string "Unsupported operand type in ARM code: BLOCK")]
     [(Register num) (string-append "r" (number->string num))]
     [(Special-Register name) (symbol->string name)]
     [Literal (ARM-literal->string operand)]))
@@ -1502,19 +1536,25 @@
      (if (hash-has-key? (CFG-data cfg) operand)
          (Data-Entry-register (hash-ref (CFG-data cfg) operand))
          (block
-          (define target-register (get-register))
+          (define target (get-target))
           (define data-idx (get-data-counter))
-          (add-ARM! cur-block (Load-Data-ARM target-register data-idx))
-          (hash-set! (CFG-data cfg) operand (Data-Entry target-register data-idx))
-          target-register))]
+          (add-ARM! cur-block (Load-Data-ARM target data-idx))
+          (hash-set! (CFG-data cfg) operand (Data-Entry target data-idx))
+          target))]
+    [(Local? operand)
+     (if (hash-has-key? (CFG-stack cfg) operand)
+         (block
+          (define target (get-target))
+          (add-ARM! cur-block (Load-Stack-ARM target (hash-ref (CFG-stack cfg) operand)))
+          target)
+         (error 'get-arm-operand "Local variable ~e is used undefined." operand))]
     [(integer? operand)
      (if (<= operand 4095)
          operand
          (block
-          (define target-register (Register counter))
+          (define target-register (get-register))
           (add-ARM! cur-block (Move-Word-Lower-ARM target-register operand))
           (add-ARM! cur-block (Move-Top-ARM target-register operand))
-          (set! counter (+ 1 counter))
           target-register))]
     [else operand]))
 
@@ -1547,5 +1587,9 @@
   (or (integer? operand) (boolean? operand) (equal? operand 'null)))
 
 ;; is this ARM instruction a control flow instruction?
-(define (ARM-control-flow-instr? [instr : ARM-Instr]) : Boolean
-  (or (Branch-Label-ARM? instr) (Branch-Equal-ARM? instr) (Branch-ARM? instr)))
+(define (ARM-branch-instr? [instr : ARM-Instr]) : Boolean
+  (or (Branch-Equal-ARM? instr) (Branch-ARM? instr)))
+
+;; MILESTONE 5 FUNCTIONS
+
+(define register-allocation #t)
