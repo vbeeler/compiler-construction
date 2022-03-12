@@ -4,6 +4,8 @@ MINI_NAME=""
 OUT_FILENAME=""
 COMPILER_MODE="registers"
 OUTPUT_TYPE="assembly"
+REGISTER_ALLOCATION="true"
+USELESS_CODE_ELIMINATION="true"
 
 for arg in "$@"
 do
@@ -14,6 +16,14 @@ do
          ;;
       -llvm)
          OUTPUT_TYPE="LLVM"
+         shift
+         ;;
+      -no-allocation)
+         REGISTER_ALLOCATION="false"
+         shift
+         ;;
+      -no-useless-code-elimination)
+         USELESS_CODE_ELIMINATION="false"
          shift
          ;;
       *)
@@ -34,4 +44,4 @@ case $OUTPUT_TYPE in
    LLVM) OUT_FILENAME=${MINI_NAME%.*}.ll ;;
 esac
 
-racket compile.rkt $(java -jar MiniCompiler.jar $MINI_NAME) $COMPILER_MODE $OUTPUT_TYPE $(basename $MINI_NAME) > $OUT_FILENAME
+racket compile.rkt $(java -jar MiniCompiler.jar $MINI_NAME) $COMPILER_MODE $OUTPUT_TYPE $REGISTER_ALLOCATION $USELESS_CODE_ELIMINATION $(basename $MINI_NAME) > $OUT_FILENAME

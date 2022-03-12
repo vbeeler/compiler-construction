@@ -39,7 +39,8 @@
       [(hash-table ('exp "dot") ('left left) ('id id))
        (Selector (parse left) (string->symbol id))]
       [(hash-table ('exp "binary") ('operator operator) ('lft left) ('rht right))
-       (Binary (string->symbol operator) (parse left) (parse right))]
+       (define bin-op (if (equal? (string->symbol operator) '\|\|) '|| (string->symbol operator)))
+       (Binary bin-op (parse left) (parse right))]
       [(hash-table ('exp "unary") ('operator operator) ('operand operand))
        (Unary (string->symbol operator) (parse operand))]
       [(hash-table ('types types) ('declarations declarations) ('functions functions))
@@ -94,17 +95,20 @@
   (check-valid-main (Environment-functions environment))
   (define LLVM-Program (create-LLVM (Program-functions AST) environment))
   (define ARM-Program (LLVM-Program->ARM-Program LLVM-Program environment))
-  (ARM-Program->string ARM-Program json-file))
+  (ARM-Program->string ARM-Program))
 
 ;; the compiler (takes in the json representation of the program) - this is the method that ./compile uses
-(define (compile-json [json-str : String] [compiler-mode : String] [output-type : String] [source-filename : String]) : String
+(define (compile-json [json-str : String] [compiler-mode : String] [output-type : String] [register-allocation : String]
+                      [useless-code-elimination : String] [source-filename : String]) : String
   (set-compiler-mode! compiler-mode)
+  (set-register-allocation! register-allocation)
+  (set-useless-code-elimination! useless-code-elimination)
   (define AST (parse-str json-str))
   (define environment (type-check-program AST))
   (define LLVM-Program (create-LLVM (Program-functions AST) environment))
   (cond
     [(equal? output-type "LLVM") (LLVM-Program->string LLVM-Program source-filename)]
-    [(equal? output-type "assembly") (ARM-Program->string (LLVM-Program->ARM-Program LLVM-Program environment) source-filename)]
+    [(equal? output-type "assembly") (ARM-Program->string (LLVM-Program->ARM-Program LLVM-Program environment))]
     [else (error 'compile-json "Unsupported output type: ~e")]))
 
 ;; the compiler (takes in the name of the json file) - kept for unit tests
@@ -170,12 +174,11 @@
         [(Block-Expr statement-list) (all-paths-return? (append statement-list (rest statements)))]
         [(Assignment target source) (all-paths-return? (rest statements))]
         [(Print expression endl) (all-paths-return? (rest statements))]
-        [(If guard then-block) (and (all-paths-return? (append (Block-Expr-statements then-block) (rest statements)))
-                                  (all-paths-return? (rest statements)))]
-        [(If-Else guard then-block else-block) (and (all-paths-return? (append (Block-Expr-statements then-block) (rest statements)))
-                                                  (all-paths-return? (append (Block-Expr-statements else-block) (rest statements))))]
-        [(Loop guard body) (and (all-paths-return? (append (Block-Expr-statements body) (rest statements)))
-                                (all-paths-return? (rest statements)))]
+        [(If guard then-block) (all-paths-return? (rest statements))]
+        [(If-Else guard then-block else-block) (or (and (all-paths-return? (Block-Expr-statements then-block))
+                                                        (all-paths-return? (Block-Expr-statements else-block)))
+                                                   (all-paths-return? (rest statements)))]
+        [(Loop guard body) (all-paths-return? (rest statements))]
         [(Delete expression) (all-paths-return? (rest statements))]
         [(Return expression) #t]
         [(Return-Void) #f]
@@ -235,7 +238,8 @@
               (error 'type-check-statement "Delete requires a structure type; given expression ~e of type ~e" expression expression-type)]))]
     [(Return expression) 
      (let ([actual-return-type : Type (type-check-expression expression env func-type)])
-       (cond [(not (equal? actual-return-type expected-return-type))
+       (cond [(not (or (equal? actual-return-type expected-return-type)
+                       (equal? actual-return-type 'null)))
               (error 'type-check-statement "Return expression ~e failed type check; given type ~e, expected type ~e"
                      expression actual-return-type expected-return-type)]))]
     [(Return-Void) (cond [(not (equal? expected-return-type 'void))
@@ -252,11 +256,13 @@
 (define (type-check-expression [expression : Expression] [env : Environment] [func-type : Function-Type]) : Expression-Type
   (match expression
     [(Binary operator left right)
-     (let ([left-type : Type (type-check-expression left env func-type)]
-           [right-type : Type (type-check-expression right env func-type)])
+     (let ([left-type : Expression-Type (type-check-expression left env func-type)]
+           [right-type : Expression-Type (type-check-expression right env func-type)])
        (cond
          [(or (equal? operator '==) (equal? operator '!=))
-          (if (and (equal? left-type right-type) (not (equal? left-type 'bool)))
+          (if (or (and (equal? left-type 'int) (equal? right-type 'int))
+                  (and (structure-type? left-type) (structure-type? right-type)
+                       (or (equal? left-type right-type) (equal? left-type 'null) (equal? right-type 'null))))
               'bool
               (error 'type-check-expression "Equality operator ~e requires operands of matching types (either 'int or structure); given expressions ~e of type ~e and ~e of type ~e"
                      operator left left-type right right-type))]
@@ -360,117 +366,122 @@
 
 ;; MILESTONE 2 FUNCTIONS
 
-(define counter 1)
-(define entry-block-label 0)
-(define mode : Compiler-Mode 'registers)
-(define c-lib-funcs (C-Lib-Funcs #f #f #f #f #f))
-(define lib-funcs (Lib-Funcs c-lib-funcs #f))
+(define INTM_COUNTER 0)
+(define BLOCK_COUNTER 0)
+(define MODE : Compiler-Mode 'registers)
+(define C_LIB_FUNCS (C-Lib-Funcs #f #f #f #f #f))
+(define LIB_FUNCS (Lib-Funcs C_LIB_FUNCS #f))
 
 ;; creates the LLVM-Program object for the program
 (define (create-LLVM [functions : (Listof Function)] [env : Environment]) : LLVM-Program
   (define struct-instrs (create-struct-instrs (Environment-structs env)))
   (define global-instrs (create-global-instrs (Environment-globals env)))
   (define func-CFGs (map (lambda ([function : Function]) (create-CFG function env)) functions))
-  (LLVM-Program struct-instrs global-instrs func-CFGs c-lib-funcs))
+  (LLVM-Program struct-instrs global-instrs func-CFGs C_LIB_FUNCS))
 
 ;; creates a control flow graph (CFG) for a single function
 (define (create-CFG [function : Function] [env : Environment]) : CFG
   (match function
     [(Function name parameters return-type declarations statements)
-     (define entry-block (initialize-entry-block return-type parameters declarations))
-     (define exit-block (Block -1 '() '() (make-hash '()) '() '() #f #f '()))
+     (define stack (ann (make-hash '()) Stack-Table))
+     (define intm-counter (Counter 0))
+     (define entry-block (initialize-entry-block return-type parameters declarations stack intm-counter))
+     (define arg-num-max-four (if (< (length parameters) 4)
+                                  (length parameters)
+                                  4))
+     (define exit-block (Block -1 '() '() '() (make-hash '()) '() '() #f #f '() (Live-Analysis (Bitset 0) (Bitset 0) (Bitset 0)) 1))
      (define blocks 
        (ann (make-hash
              (list (cons 'entry-block entry-block)
                    (cons 'exit-block exit-block)))
             Block-Table))
-     (add-statements-LLVM! entry-block blocks statements env name)
+     (add-statements-LLVM! entry-block blocks statements env name intm-counter)
      (map remove-trivial-phis! (map Block-LLVM (hash-values blocks)) (hash-values blocks))
      (cond [(not (empty? (Block-successors entry-block)))
             (set-Block-reachable! exit-block #t)
-            (cleanup-exit-block exit-block return-type)
+            (cleanup-exit-block exit-block return-type intm-counter)
             (add-return-voids! entry-block exit-block (make-hash '()))]
            [(and (equal? return-type 'void)
                  (or (empty? (Block-LLVM entry-block))
                      (not (Return-Void-LLVM? (last (Block-LLVM entry-block))))))
             (add-LLVM! entry-block (Return-Void-LLVM))])
-     (CFG name parameters return-type blocks (ann (make-hash '()) Stack-Table) (ann (make-hash '()) Data-Table) 0)]))
+     (cond [USELESS_CODE_ELIMINATION? (useless-code-elimination! blocks)])
+     (CFG name parameters return-type blocks stack 0 0 '() intm-counter)]))
 
 ;; adds the LLVM for the given list of statements to the supplied block
 ;; updates the block hash table accordingly
-(define (add-statements-LLVM! [cur-block : Block] [blocks : Block-Table] [statements : (Listof Statement)] [env : Environment] [func-name : Symbol]) : Block
+(define (add-statements-LLVM! [cur-block : Block] [blocks : Block-Table] [statements : (Listof Statement)] [env : Environment] [func-name : Symbol] [counter : Counter]) : Block
   (if (empty? statements)
       cur-block
       (match (first statements)
         [(Block-Expr statement-list)
-         (add-statements-LLVM! cur-block blocks (append statement-list (rest statements)) env func-name)]
+         (add-statements-LLVM! cur-block blocks (append statement-list (rest statements)) env func-name counter)]
         [(Assignment target source)
          (if (equal? source 'read)
-             (add-read-LLVM! target cur-block env func-name)
-             (add-assignment-LLVM! target source cur-block env func-name))
-         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
+             (add-read-LLVM! target cur-block env func-name counter)
+             (add-assignment-LLVM! target source cur-block env func-name counter))
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name counter)]
         [(Print expression endl)
-         (define exp-operand (add-expression-LLVM! expression cur-block env func-name))
-         (define target (Intermediate counter))
-         (set! counter (+ 1 counter))
-         (add-LLVM! cur-block (Print-LLVM exp-operand endl target))
+         (define exp-operand (add-expression-LLVM! expression cur-block env func-name counter))
+         (define intermediate (get-intermediate counter))
+         (add-LLVM! cur-block (Print-LLVM exp-operand endl intermediate))
          (if endl
-             (set-C-Lib-Funcs-printf-newline! c-lib-funcs #t)
-             (set-C-Lib-Funcs-printf-space! c-lib-funcs #t))
-         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
+             (set-C-Lib-Funcs-printf-newline! C_LIB_FUNCS #t)
+             (set-C-Lib-Funcs-printf-space! C_LIB_FUNCS #t))
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name counter)]
         [(If guard then)
-         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
-         (define then-block (create-block (list cur-block) #t blocks))
-         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name))
-         (define after-block (create-block (list cur-block) #t blocks))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name counter))
+         (define then-block (create-block (list cur-block) #t blocks (/ (Block-execution-frequency cur-block) 2)))
+         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name counter))
+         (define after-block (create-block (list cur-block) #t blocks (Block-execution-frequency cur-block)))
          (add-branch! last-then-block after-block)
          (add-LLVM! cur-block (Cond-Branch-LLVM guard-operand then-block after-block))
-         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name counter)]
         [(If-Else guard then else)
-         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
-         (define then-block (create-block (list cur-block) #t blocks))
-         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name))
-         (define else-block (create-block (list cur-block) #t blocks))
-         (define last-else-block (add-statements-LLVM! else-block blocks (list else) env func-name))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name counter))
+         (define then-block (create-block (list cur-block) #t blocks (/ (Block-execution-frequency cur-block) 2)))
+         (define last-then-block (add-statements-LLVM! then-block blocks (list then) env func-name counter))
+         (define else-block (create-block (list cur-block) #t blocks (/ (Block-execution-frequency cur-block) 2)))
+         (define last-else-block (add-statements-LLVM! else-block blocks (list else) env func-name counter))
          (add-LLVM! cur-block (Cond-Branch-LLVM guard-operand then-block else-block))
-         (define after-block (create-block (list last-then-block last-else-block) #t blocks))
+         (define after-block (create-block (list last-then-block last-else-block) #t blocks (Block-execution-frequency cur-block)))
          (add-branch! last-then-block after-block)
          (add-branch! last-else-block after-block)
-         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name counter)]
         [(Loop guard body)
-         (define guard-operand (add-expression-LLVM! guard cur-block env func-name))
-         (define body-block (create-block (list cur-block) #f blocks))
-         (define last-body-block (add-statements-LLVM! body-block blocks (list body) env func-name))
-         (define new-guard-operand (add-expression-LLVM! guard last-body-block env func-name))
-         (define after-block (create-block (list cur-block last-body-block) #t blocks))
+         (define guard-operand (add-expression-LLVM! guard cur-block env func-name counter))
+         (define body-block (create-block (list cur-block) #f blocks (* (Block-execution-frequency cur-block) 10)))
+         (define last-body-block (add-statements-LLVM! body-block blocks (list body) env func-name counter))
+         (define new-guard-operand (add-expression-LLVM! guard last-body-block env func-name counter))
+         (define after-block (create-block (list cur-block last-body-block) #t blocks (Block-execution-frequency cur-block)))
          (add-LLVM! cur-block (Cond-Branch-LLVM guard-operand body-block after-block))
          (set-Block-successors! cur-block (list body-block after-block))
          (add-loop-branch! last-body-block new-guard-operand body-block after-block cur-block)
          (cond
-           [(equal? mode 'registers) (complete-phis! (Block-LLVM body-block) body-block)
+           [(equal? MODE 'registers) (complete-phis! (Block-LLVM body-block) body-block counter)
                                      (set-Block-sealed! body-block #t)])
-         (add-statements-LLVM! after-block blocks (rest statements) env func-name)]
+         (add-statements-LLVM! after-block blocks (rest statements) env func-name counter)]
         [(Delete expression)
-         (define exp-operand (add-expression-LLVM! expression cur-block env func-name))
+         (define intermediate (get-intermediate counter))
+         (define exp-operand (add-expression-LLVM! expression cur-block env func-name counter))
          (add-LLVMs! cur-block (list (Size-LLVM 'bitcast
                                                  exp-operand
                                                  (string-append "%struct." (symbol->string (type-check-expression expression env (hash-ref (Environment-functions env) func-name))) "*")
                                                  "i8*"
-                                                 (Intermediate counter))
-                                     (Free-LLVM (Intermediate counter))))
-         (set! counter (+ 1 counter))
-         (set-C-Lib-Funcs-free! c-lib-funcs #t)
-         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)]
+                                                 intermediate)
+                                     (Free-LLVM intermediate)))
+         (set-C-Lib-Funcs-free! C_LIB_FUNCS #t)
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name counter)]
         [(Return expression)
-         (define result (add-expression-LLVM! expression cur-block env func-name))
+         (define result (add-expression-LLVM! expression cur-block env func-name counter))
          (define return-type (Function-Type-return-type (hash-ref (Environment-functions env) func-name)))
          (define exit-block (hash-ref blocks 'exit-block))
          (if (equal? (Block-label cur-block) (Block-label (hash-ref blocks 'entry-block)))
              (add-LLVM! cur-block (Return-Expr-LLVM return-type result))
              (block
               (cond
-                [(equal? mode 'stack) (add-LLVM! cur-block (Store-LLVM return-type result (Local '.return) (if (structure-type? return-type) 1 0)))]
-                [(equal? mode 'registers) (write-variable! 'return result cur-block)])
+                [(equal? MODE 'stack) (add-LLVM! cur-block (Store-LLVM return-type result (Local '.return) (if (structure-type? return-type) 1 0)))]
+                [(equal? MODE 'registers) (write-variable! 'return result cur-block)])
               (add-LLVM! cur-block (Branch-LLVM exit-block))
               (set-Block-successors! cur-block (list exit-block))
               (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))))
@@ -485,116 +496,120 @@
               (set-Block-predecessors! exit-block (cons cur-block (Block-predecessors exit-block)))))
          cur-block]
         [(Invocation id arguments)
-         (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
+         (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name counter)) arguments))
          (define function (hash-ref (Environment-functions env) id))
          (define return-type (Function-Type-return-type function))
          (if (equal? 'void return-type)
              (add-LLVM! cur-block (Call-Void-LLVM (Global id) (Function-Type-args function) args))
-             (add-LLVM! cur-block (Call-LLVM (Global id) return-type (Function-Type-args function) args (get-target))))
-         (add-statements-LLVM! cur-block blocks (rest statements) env func-name)])))
+             (add-LLVM! cur-block (Call-LLVM (Global id) return-type (Function-Type-args function) args (get-intermediate counter))))
+         (add-statements-LLVM! cur-block blocks (rest statements) env func-name counter)])))
 
 ;; adds the LLVM for the given expression to the supplied block
 ;; returns the operand that holds the result of this expression
-(define (add-expression-LLVM! [expression : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Operand
+(define (add-expression-LLVM! [expression : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol] [counter : Counter]) : Operand
   (match expression
     [(Binary operator left right)
-     (define left-result (add-expression-LLVM! left cur-block env func-name))
-     (define right-result (add-expression-LLVM! right cur-block env func-name))
-     (define target (get-target))
+     (define left-result (add-expression-LLVM! left cur-block env func-name counter))
+     (define right-result (add-expression-LLVM! right cur-block env func-name counter))
+     (define intermediate (get-intermediate counter))
      (cond [(member operator (list '+ '- '* '/))
-            (add-LLVM! cur-block (Arith-LLVM operator left-result right-result target))]
+            (add-LLVM! cur-block (Arith-LLVM operator left-result right-result intermediate))]
            [(member operator (list '|| '&& '^^))
-            (add-LLVM! cur-block (Bool-LLVM operator left-result right-result target))]
+            (add-LLVM! cur-block (Bool-LLVM operator left-result right-result intermediate))]
            [(member operator (list '== '!= '< '> '<= '>=))
             (define type (if (or (equal? operator '==) (equal? operator '!=))
                              (type-check-expression left env (hash-ref (Environment-functions env) func-name))
                              'int))
-            (add-LLVM! cur-block (Comp-LLVM operator type left-result right-result target))])
-     target]
+            (add-LLVM! cur-block (Comp-LLVM operator type left-result right-result intermediate))])
+     intermediate]
     [(Unary operator expression)
-     (define result (add-expression-LLVM! expression cur-block env func-name))
-     (define target (get-target))
-     (cond [(equal? operator '-) (add-LLVM! cur-block (Arith-LLVM '- 0 result target))]
-           [(equal? operator '!) (add-LLVM! cur-block (Bool-LLVM '^^ result #t target))])
-     target]
+     (define result (add-expression-LLVM! expression cur-block env func-name counter))
+     (define intermediate (get-intermediate counter))
+     (cond [(equal? operator '-) (add-LLVM! cur-block (Arith-LLVM '- 0 result intermediate))]
+           [(equal? operator '!) (add-LLVM! cur-block (Bool-LLVM '^^ result #t intermediate))])
+     intermediate]
     [(Selector left id)
-     (define pointer (add-selector-LLVM! expression cur-block env func-name))
+     (define pointer (add-selector-LLVM! expression cur-block env func-name counter))
      (define type (type-check-expression left env (hash-ref (Environment-functions env) func-name)))
-     (define next-target (get-target))
+     (define intermediate (get-intermediate counter))
      (define field (hash-ref (Struct-Type-fields (hash-ref (Environment-structs env) type)) id))
-     (add-LLVM! cur-block (Load-LLVM (Field-type field) pointer next-target (if (structure-type? (Field-type field)) 1 0)))
-     next-target]
+     (add-LLVM! cur-block (Load-LLVM (Field-type field) pointer intermediate (if (structure-type? (Field-type field)) 1 0)))
+     intermediate]
     [(Invocation id arguments)
-     (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name)) arguments))
-     (define target (get-target))
+     (define args (map (lambda ([arg : Expression]) (add-expression-LLVM! arg cur-block env func-name counter)) arguments))
+     (define intermediate (get-intermediate counter))
      (define function (hash-ref (Environment-functions env) id))
-     (add-LLVM! cur-block (Call-LLVM (Global id) (Function-Type-return-type function) (Function-Type-args function) args target))
-     target]
+     (add-LLVM! cur-block (Call-LLVM (Global id) (Function-Type-return-type function) (Function-Type-args function) args intermediate))
+     intermediate]
     [(Allocation id)
-     (define first-target (get-target))
-     (define second-target (get-target))
-     (set-C-Lib-Funcs-malloc! c-lib-funcs #t)
-     (add-LLVM! cur-block (Malloc-LLVM first-target (get-type-size id env)))
-     (add-LLVM! cur-block (Size-LLVM 'bitcast first-target "i8*" (string-append "%struct." (symbol->string id) "*") second-target))
-     second-target]
+     (define first-intermediate (get-intermediate counter))
+     (define second-intermediate (get-intermediate counter))
+     (set-C-Lib-Funcs-malloc! C_LIB_FUNCS #t)
+     (add-LLVM! cur-block (Malloc-LLVM first-intermediate (get-type-size id env)))
+     (add-LLVM! cur-block (Size-LLVM 'bitcast first-intermediate "i8*" (string-append "%struct." (symbol->string id) "*") second-intermediate))
+     second-intermediate]
     [literal
      (cond
        [(equal? 'null literal) 'null]
        [(symbol? literal)
         (define declaration (get-declaration literal (Function-Type-locals (hash-ref (Environment-functions env) func-name)) (Environment-globals env)))
         (define type (LLVM-Declaration-type declaration))
+        (define operand (LLVM-Declaration-operand declaration))
         (cond
-          [(equal? mode 'stack)
-           (define target (get-target))
-           (add-LLVM! cur-block (Load-LLVM type (LLVM-Declaration-operand declaration) target (if (structure-type? type) 1 0)))
-           target]
-          [(equal? mode 'registers) (Phi-Value-operand (read-variable literal type cur-block))]
-          [else (error 'add-expression-LLVM! "Unsupported compiler mode, given ~e" mode)])]
+          [(equal? MODE 'stack)
+           (define intermediate (get-intermediate counter))
+           (add-LLVM! cur-block (Load-LLVM type (LLVM-Declaration-operand declaration) intermediate (if (structure-type? type) 1 0)))
+           intermediate]
+          [(equal? MODE 'registers)
+           (if (Local? operand)
+               (Phi-Value-operand (read-variable literal type cur-block counter))
+               operand)]
+          [else (error 'add-expression-LLVM! "Unsupported compiler mode, given ~e" MODE)])]
        [(integer? literal) literal]
        [(boolean? literal) literal]
        [else (error 'add-expression-LLVM! "Invalid expression type ~e" literal)])]))
 
 ;; adds the LLVM for a read instruction to the current block
-(define (add-read-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Void
-  (set-C-Lib-Funcs-scanf! c-lib-funcs #t)
+(define (add-read-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol] [counter : Counter]) : Void
+  (set-C-Lib-Funcs-scanf! C_LIB_FUNCS #t)
   (cond
-    [(equal? mode 'stack)
+    [(equal? MODE 'stack)
      (define target-operand
        (if (symbol? target)
            (if (hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) target)
                (Local target)
                (Global target)) 
-           (add-selector-LLVM! target cur-block env func-name)))
-     (add-LLVM! cur-block (Scan-LLVM target-operand (get-target)))]
-    [(equal? mode 'registers)
+           (add-selector-LLVM! target cur-block env func-name counter)))
+     (add-LLVM! cur-block (Scan-LLVM target-operand (get-intermediate counter)))]
+    [(equal? MODE 'registers)
      (cond
        [(symbol? target)
         (cond
           [(hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) target)
-           (define first-target (get-target))
-           (define second-target (get-target))
-           (add-LLVMs! cur-block (list (Scan-LLVM (Global '.read_scratch) first-target)
-                                       (Load-LLVM 'int (Global '.read_scratch) second-target 0)))
-           (write-variable! target second-target cur-block)]
-          [else (add-LLVM! cur-block (Scan-LLVM (Global target) (get-target)))])]
-       [else (add-LLVM! cur-block (Scan-LLVM (add-selector-LLVM! target cur-block env func-name) (get-target)))])]
-    [else (error 'add-read-LLVM! "Unsupported compiler mode: ~e" mode)]))
+           (define first-intermediate (get-intermediate counter))
+           (define second-intermediate (get-intermediate counter))
+           (add-LLVMs! cur-block (list (Scan-LLVM (Global '.read_scratch) first-intermediate)
+                                       (Load-LLVM 'int (Global '.read_scratch) second-intermediate 0)))
+           (write-variable! target second-intermediate cur-block)]
+          [else (add-LLVM! cur-block (Scan-LLVM (Global target) (get-intermediate counter)))])]
+       [else (add-LLVM! cur-block (Scan-LLVM (add-selector-LLVM! target cur-block env func-name counter) (get-intermediate counter)))])]
+    [else (error 'add-read-LLVM! "Unsupported compiler mode: ~e" MODE)]))
 
 ;; adds the LLVM for an assignment instruction to the current block
-(define (add-assignment-LLVM! [target : Expression] [source : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Void
+(define (add-assignment-LLVM! [target : Expression] [source : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol] [counter : Counter]) : Void
   (cond
-    [(equal? mode 'stack)
+    [(equal? MODE 'stack)
      (define target-operand
        (if (symbol? target)
            (if (hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) target)
                (Local target)
                (Global target))
-           (add-selector-LLVM! target cur-block env func-name)))
-     (define source-operand (add-expression-LLVM! source cur-block env func-name))
+           (add-selector-LLVM! target cur-block env func-name counter)))
+     (define source-operand (add-expression-LLVM! source cur-block env func-name counter))
      (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
      (add-LLVM! cur-block (Store-LLVM type source-operand target-operand (if (structure-type? type) 1 0)))]
-    [(equal? mode 'registers)
-     (define source-operand (add-expression-LLVM! source cur-block env func-name))
+    [(equal? MODE 'registers)
+     (define source-operand (add-expression-LLVM! source cur-block env func-name counter))
      (if (symbol? target)
          (if (hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) target)
              (write-variable! target source-operand cur-block)
@@ -602,72 +617,70 @@
               (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
               (add-LLVM! cur-block (Store-LLVM type source-operand (Global target) (if (structure-type? type) 1 0)))))
          (block
-          (define target-operand (add-selector-LLVM! target cur-block env func-name))
+          (define target-operand (add-selector-LLVM! target cur-block env func-name counter))
           (define type (type-check-expression target env (hash-ref (Environment-functions env) func-name)))
           (add-LLVM! cur-block (Store-LLVM type source-operand target-operand (if (structure-type? type) 1 0)))))]
-    [else (error 'add-assignment-LLVM! "Unsupported compiler mode: ~e" mode)]))
+    [else (error 'add-assignment-LLVM! "Unsupported compiler mode: ~e" MODE)]))
 
 ;; adds the LLVM for a selector to the current block - simply gets the address of the desired field
 ;; this method is necessary since there is different behavior for selectors as right vs left values of assignments (need value vs address respectively)
-(define (add-selector-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol]) : Operand
+(define (add-selector-LLVM! [target : Expression] [cur-block : Block] [env : Environment] [func-name : Symbol] [counter : Counter]) : Operand
   (match target
     [(Selector left id)
      (define type (type-check-expression left env (hash-ref (Environment-functions env) func-name)))
      (define pointer (if (symbol? left)            
                          (if (hash-has-key? (Function-Type-locals (hash-ref (Environment-functions env) func-name)) left)
-                             (block
-                              (define target (get-target))
-                              (define source (cond
-                                               [(equal? mode 'stack) (Local left)]
-                                               [(equal? mode 'registers) (Phi-Value-operand (read-variable left type cur-block))]
-                                               [else (error 'add-selector-LLVM "Unsupported compiler mode ~e" mode)]))
-                              (add-LLVM! cur-block (Load-LLVM type source target 1))
-                              target)
+                             (cond
+                               [(equal? MODE 'stack) (define intermediate (get-intermediate counter))
+                                                     (add-LLVM! cur-block (Load-LLVM type (Local left) intermediate 1))
+                                                     intermediate]
+                               [(equal? MODE 'registers) (Phi-Value-operand (read-variable left type cur-block counter))]
+                               [else (error 'add-selector-LLVM "Unsupported compiler mode ~e" MODE)])
                              (Global left))
-                         (add-expression-LLVM! left cur-block env func-name)))
-     (define first-target (get-target))
+                         (add-expression-LLVM! left cur-block env func-name counter)))
+     (define next-intermediate (get-intermediate counter))
      (define field (hash-ref (Struct-Type-fields (hash-ref (Environment-structs env) type)) id))
-     (add-LLVM! cur-block (Get-Elm-Ptr-LLVM type pointer (Field-index field) first-target))
-     first-target]
+     (add-LLVM! cur-block (Get-Elm-Ptr-LLVM type pointer (Field-index field) next-intermediate))
+     next-intermediate]
     [else (error 'add-selector-LLVM! "Unsupported behavior - ~e is an invalid left expression of an assignment operation." target)]))
 
 ;; complete the phis of the given block in the process of sealing it
-(define (complete-phis! [instructions : (Listof LLVM-Instr)] [cur-block : Block]) : Void     
+(define (complete-phis! [instructions : (Listof LLVM-Instr)] [cur-block : Block] [counter : Counter]) : Void     
   (cond
     [(and (not (empty? instructions)) (Phi-LLVM? (first instructions)))
      (match (first instructions)
        [(Phi-LLVM var type values target complete)
-        (cond [(not complete) (add-phi-operands! (first instructions) cur-block (Block-predecessors cur-block))
+        (cond [(not complete) (add-phi-operands! (first instructions) cur-block (Block-predecessors cur-block) counter)
                               (set-Phi-LLVM-complete! (first instructions) #t)])
-        (complete-phis! (rest instructions) cur-block)])]))
+        (complete-phis! (rest instructions) cur-block counter)])]))
 
 ;; add operands to the phi instruction by finding the value of the variable from each of the block's predecessors
-(define (add-phi-operands! [phi : Phi-LLVM] [cur-block : Block] [predecessors : (Listof Block)]) : Void
+(define (add-phi-operands! [phi : Phi-LLVM] [cur-block : Block] [predecessors : (Listof Block)] [counter : Counter]) : Void
   (cond
     [(not (empty? predecessors))
-     (set-Phi-LLVM-values! phi (append (Phi-LLVM-values phi) (list (read-variable (Phi-LLVM-var phi) (Phi-LLVM-type phi) (first predecessors)))))
-     (add-phi-operands! phi cur-block (rest predecessors))]))
+     (set-Phi-LLVM-values! phi (append (Phi-LLVM-values phi) (list (read-variable (Phi-LLVM-var phi) (Phi-LLVM-type phi) (first predecessors) counter))))
+     (add-phi-operands! phi cur-block (rest predecessors) counter)]))
 
 ;; get the value of the variable in the current block (may need to look at its predecessors and add phi nodes)
-(define (read-variable [var : Symbol] [type : Type] [cur-block : Block]) : Phi-Value
+(define (read-variable [var : Symbol] [type : Type] [cur-block : Block] [counter : Counter]) : Phi-Value
   (match cur-block
-    [(Block _ _ _ definitions predecessors _ _ sealed _)
+    [(Block _ _ _ _ definitions predecessors _ _ sealed _ _ _)
      (cond
        [(hash-has-key? definitions var) (Phi-Value (hash-ref definitions var) (Block-label cur-block))]
-       [(not sealed) (define target (get-target))
-                     (set-Block-LLVM! cur-block (cons (Phi-LLVM var type '() target #f) (Block-LLVM cur-block)))
-                     (write-variable! var target cur-block)
-                     (Phi-Value target (Block-label cur-block))]
+       [(not sealed) (define intermediate (get-intermediate counter))
+                     (set-Block-LLVM! cur-block (cons (Phi-LLVM var type '() intermediate #f) (Block-LLVM cur-block)))
+                     (write-variable! var intermediate cur-block)
+                     (Phi-Value intermediate (Block-label cur-block))]
        [(empty? predecessors) (error 'read-variable "Variable with identifier ~e has not been initialized in block ~e" var cur-block)]
-       [(equal? (length predecessors) 1) (define value (read-variable var type (first predecessors)))
+       [(equal? (length predecessors) 1) (define value (read-variable var type (first predecessors) counter))
                                          (write-variable! var (Phi-Value-operand value) cur-block)
                                          value]
-       [else (define target (get-target))
-             (define phi (Phi-LLVM var type '() target #t))
+       [else (define intermediate (get-intermediate counter))
+             (define phi (Phi-LLVM var type '() intermediate #t))
              (set-Block-LLVM! cur-block (cons phi (Block-LLVM cur-block)))
-             (write-variable! var target cur-block)
-             (add-phi-operands! phi cur-block predecessors)
-             (Phi-Value target (Block-label cur-block))])]))
+             (write-variable! var intermediate cur-block)
+             (add-phi-operands! phi cur-block predecessors counter)
+             (Phi-Value intermediate (Block-label cur-block))])]))
 
 ;; add the variable to the list of definitions - if it is already defined, redefine it
 (define (write-variable! [var : Symbol] [value : Operand] [cur-block : Block]) : Void
@@ -745,7 +758,7 @@
 ;; generates a visual representation of the CFG using dot!
 (define (generate-graph [program : LLVM-Program] [input-filename : String]) : Void
   (match program
-    [(LLVM-Program structs globals CFGs c-lib-funcs)
+    [(LLVM-Program structs globals CFGs C_LIB_FUNCS)
      (define out (open-output-file (string-append input-filename ".dot") #:exists 'replace))
      (display (apply string-append (map generate-digraph CFGs)) out)
      (close-output-port out)]))
@@ -753,7 +766,7 @@
 ;; generates the string for a single CFG (for one function)
 (define (generate-digraph [cfg : CFG]) : String
   (match cfg
-    [(CFG func-name parameters return-type blocks _ _ _)
+    [(CFG func-name parameters return-type blocks _ _ _ _ _)
      (define dot-code (string-append "digraph \"" (symbol->string func-name) "\" {\n"))
      (define entry-block (hash-ref blocks 'entry-block))
      (set! dot-code (string-append dot-code (apply string-append (map generate-label (hash-values blocks)))))
@@ -763,7 +776,7 @@
 ;; generate dot code for a label
 (define (generate-label [cur-block : Block]) : String
   (match cur-block
-    [(Block label LLVM _ definitions _ _ reachable _ _)
+    [(Block label LLVM _ _ definitions _ _ reachable _ _ _ _)
      (if reachable
          (string-append (number->string label) "[ label = \"" (number->string label) "\n" (LLVMs->string LLVM)
                         "\", xlabel = \"" (apply string-append (map definition->string (hash->list definitions))) "\"]\n")
@@ -772,7 +785,7 @@
 ;; generate dot code for an edge
 (define (generate-edge [cur-block : Block]) : String
   (match cur-block
-    [(Block label _ _ _ _ successors _ _ _)
+    [(Block label _ _ _ _ _ successors _ _ _ _ _)
      (if (empty? successors)
          ""
          (apply string-append (map (lambda ([successor-label : Integer])
@@ -849,7 +862,7 @@
 ;; converts a Control Flow Graph (CFG) to its string representation
 (define (LLVM-CFG->string [cfg : CFG]) : String
   (match cfg
-    [(CFG func-name parameters return-type blocks _ _ _)
+    [(CFG func-name parameters return-type blocks _ _ _ _ _)
      (string-append "define " (type->string return-type (Levels-Indirection 0 1))
                     " @" (symbol->string func-name) "(" (get-parameters-string parameters 0)
                     ") {\n" (block-table->string blocks))]))
@@ -863,7 +876,7 @@
 ;; converts a block to its string representation
 (define (block->string [cur-block : Block] [entry-block? : Boolean]) : String
   (match cur-block
-    [(Block label LLVM _ _ _ _ _ _ _)
+    [(Block label LLVM _ _ _ _ _ _ _ _ _ _)
      (if (empty? LLVM)
          ""
          (string-append (if entry-block?
@@ -968,8 +981,9 @@
     [(Local id) (string-append "%" (symbol->string id))]
     [(Global id) (string-append "@" (symbol->string id))]
     [(Intermediate value) (string-append "%" (number->string value))]
-    [(Block label _ _ _ _ _ _ _ _) (string-append "%" (number->string label))]
+    [(Block label _ _ _ _ _ _ _ _ _ _ _) (string-append "%" (number->string label))]
     [(Register num) (string-append "%" (number->string num))]
+    [(Parameter num) (string-append "p" (number->string num))]
     [Literal (literal->string operand)]))
 
 ;; converts operators to their string representation
@@ -1025,12 +1039,12 @@
        (define first-param-str
          (string-append (type->string (Declaration-type (first parameters)) (Levels-Indirection 0 1))                            
                         (cond
-                          [(equal? mode 'stack)
+                          [(equal? MODE 'stack)
                            (if (structure-type? (Declaration-type (first parameters)))
                                (string-append " %" (symbol->string (Declaration-id (first parameters))))
                                "")]
-                          [(equal? mode 'registers) (string-append " %" (number->string param-idx))]
-                          [else (error 'get-parameters-string "Unsupported compiler mode: ~e" mode)])))
+                          [(equal? MODE 'registers) (string-append " %" (number->string param-idx))]
+                          [else (error 'get-parameters-string "Unsupported compiler mode: ~e" MODE)])))
        (if (empty? (rest parameters))
            first-param-str
            (string-append first-param-str ", " (get-parameters-string (rest parameters) (+ 1 param-idx)))))))
@@ -1048,23 +1062,25 @@
 
 ;; initialize the entry block of a function
 ;; this entails allocating declarations and storing parameter values on the stack
-(define (initialize-entry-block [return-type : Return-Type] [parameters : (Listof Declaration)] [declarations : (Listof Declaration)]) : Block
-  (set! counter 0)
-  (define entry-block (Block -1 '() '() (make-hash '()) '() '() #t #t '()))
+(define (initialize-entry-block [return-type : Return-Type] [parameters : (Listof Declaration)] [declarations : (Listof Declaration)] [stack : Stack-Table] [counter : Counter]) : Block
+  (define entry-block (Block (get-block-counter) '() '() '() (make-hash '()) '() '() #t #t '() (Live-Analysis (Bitset 0) (Bitset 0) (Bitset 0)) 1))
   (cond
-    [(equal? mode 'stack)
+    [(equal? MODE 'stack)
      (cond [(not (equal? return-type 'void))
             (add-LLVM! entry-block (Alloca-LLVM return-type (Local '.return)))])
      (allocate-declarations entry-block parameters declarations)
-     (store-parameters entry-block parameters)]
-    [(equal? mode 'registers)
-     (map (lambda ([var : Symbol])
-            (write-variable! var (get-target) entry-block))
-          (map Declaration-id parameters))]
-    [else (error 'initialize-entry-block "Unsupported compiler mode ~e:" mode)])
-  (set-Block-label! entry-block counter)
-  (set! entry-block-label counter)
-  (set! counter (+ 1 counter))
+     (store-parameters entry-block parameters counter)]
+    [(equal? MODE 'registers)
+     (define arg-num 0)
+     (define arg-ids (map Declaration-id parameters))
+     (for-each (lambda ([var : Symbol])
+                 (cond [(< arg-num 4)
+                        (write-variable! var (Parameter arg-num) entry-block)]
+                       [else (write-variable! var (Parameter arg-num) entry-block)
+                             (hash-set! stack (Parameter arg-num) (* 4 (- arg-num 3)))])
+                 (set! arg-num (+ 1 arg-num)))
+               arg-ids)]
+    [else (error 'initialize-entry-block "Unsupported compiler mode ~e:" MODE)])
   entry-block)
 
 ;; create the alloca instructions in the entry block
@@ -1077,52 +1093,51 @@
 
 ;; store the values of all non-struct parameters into local variables on the stack
 ;; we don't allocate or store structure parameters (as explained above)
-(define (store-parameters [entry-block : Block] [parameters : (Listof Declaration)]) : Void
+(define (store-parameters [entry-block : Block] [parameters : (Listof Declaration)] [counter : Counter]) : Void
   (define non-struct-params (filter (lambda ([param : Declaration]) (not (structure-type? (Declaration-type param)))) parameters))
   (add-LLVMs! entry-block (map (lambda ([param : Declaration])
-                                (define target (Intermediate counter))
-                                (set! counter (+ 1 counter))
-                                (Store-LLVM (Declaration-type param) target (Local (Declaration-id param)) 0))
+                                (Store-LLVM (Declaration-type param) (get-intermediate counter) (Local (Declaration-id param)) 0))
                               non-struct-params)))
 
 ;; clean up the exit block
 ;; this entails adding return instructions and setting the label (we couldn't set it before since block labels must be sequential)
-(define (cleanup-exit-block [exit-block : Block] [return-type : Return-Type]) : Void
+(define (cleanup-exit-block [exit-block : Block] [return-type : Return-Type] [counter : Counter]) : Void
   (set-Block-sealed! exit-block #t)
   (if (equal? return-type 'void)
       (add-LLVM! exit-block (Return-Void-LLVM))
       (cond
-        [(equal? mode 'stack)
-         (add-LLVMs! exit-block (list (Load-LLVM return-type (Local '.return) (Intermediate (+ 1 counter)) (if (structure-type? return-type) 1 0))
-                                      (Return-Expr-LLVM return-type (Intermediate (+ 1 counter)))))]
-        [(equal? mode 'registers)
-         (add-LLVM! exit-block (Return-Expr-LLVM return-type (Phi-Value-operand (read-variable 'return return-type exit-block))))]))
-  (set-Block-label! exit-block counter))
+        [(equal? MODE 'stack)
+         (define intermediate (get-intermediate counter))
+         (add-LLVMs! exit-block (list (Load-LLVM return-type (Local '.return) intermediate (if (structure-type? return-type) 1 0))
+                                      (Return-Expr-LLVM return-type intermediate)))]
+        [(equal? MODE 'registers)
+         (add-LLVM! exit-block (Return-Expr-LLVM return-type (Phi-Value-operand (read-variable 'return return-type exit-block counter))))]))
+  (set-Block-label! exit-block (get-block-counter)))
 
 ;; creates a block and puts it in the hash table
-(define (create-block [predecessors : (Listof Block)] [sealed : Boolean] [blocks : Block-Table]) : Block
-  (define cur-block (Block counter '() '() (make-hash '()) predecessors '() #t sealed '()))
+(define (create-block [predecessors : (Listof Block)] [sealed : Boolean] [blocks : Block-Table] [execution-frequency : Real]) : Block
+  (define block-idx (get-block-counter))
+  (define cur-block (Block block-idx '() '() '() (make-hash '()) predecessors '() #t sealed '() (Live-Analysis (Bitset 0) (Bitset 0) (Bitset 0)) execution-frequency))
   (map (lambda ([pred : Block]) (set-Block-successors! pred (cons cur-block (Block-successors pred)))) predecessors)
-  (hash-set! blocks counter cur-block)
-  (set! counter (+ 1 counter))
+  (hash-set! blocks block-idx cur-block)
   cur-block)
 
-;; gets the target for an expression
-(define (get-target) : Target
-  (define target (Intermediate counter))
-  (set! counter (+ 1 counter))
-  target)
+;; gets a new target for an expression
+(define (get-intermediate [counter : Counter]) : Operand
+  (define intermediate (Intermediate (Counter-num counter)))
+  (set-Counter-num! counter (+ 1 (Counter-num counter)))
+  intermediate)
 
 ;; add a branch between the two blocks if the from-block did not return (this would be indicated by a branch instruction already present)
 (define (add-branch! [from-block : Block] [to-block : Block]) : Void
-  (cond [(not (Branch-LLVM? (last (Block-LLVM from-block))))
+  (cond [(or (empty? (Block-LLVM from-block)) (not (Branch-LLVM? (last (Block-LLVM from-block)))))
          (set-Block-successors! from-block (list to-block))
          (set-Block-predecessors! to-block (cons from-block (Block-predecessors to-block)))
          (add-LLVM! from-block (Branch-LLVM to-block))]))
 
 ;; add a conditional branch to the two blocks if the current block did not return (this would be indicated by a branch instruction already present)
 (define (add-loop-branch! [cur-block : Block] [guard : Operand] [body-block : Block] [after-block : Block] [header-block : Block]) : Void
-  (cond [(not (Branch-LLVM? (last (Block-LLVM cur-block))))
+  (cond [(or (empty? (Block-LLVM cur-block)) (not (Branch-LLVM? (last (Block-LLVM cur-block)))))
          (set-Block-successors! cur-block (list body-block after-block))
          (set-Block-predecessors! body-block (list cur-block header-block))
          (add-LLVM! cur-block (Cond-Branch-LLVM guard body-block after-block))]))
@@ -1141,7 +1156,7 @@
 
 ;; set compiler mode from string
 (define (set-compiler-mode! [flag : String]) : Void
-  (set! mode (cond
+  (set! MODE (cond
                [(equal? flag "stack") 'stack]
                [(equal? flag "registers") 'registers]
                [else (error 'set-compiler-mode "Compiler mode ~e does not exist. Supported modes: \"-stack\" and \"-registers\"" flag)])))
@@ -1163,8 +1178,8 @@
 
 ;; MILESTONE 4 FUNCTIONS
 
-(define stack-counter 1)
-(define data-counter 0)
+(define STACK_COUNTER 0)
+(define SPILL_STACK_COUNTER 0)
 
 ;; convert an LLVM program to an ARM program (add the ARM code to each block)
 (define (LLVM-Program->ARM-Program [LLVM-Prog : LLVM-Program] [env : Environment]) : ARM-Program
@@ -1172,14 +1187,15 @@
     [(LLVM-Program structs globals CFGs c-lib-funcs)
      (define global-ARM (create-global-ARM globals env))
      (for-each (lambda ([cfg : CFG])
-                 (set! stack-counter 1)
-                 (set! data-counter 0)
+                 (set! STACK_COUNTER 0)
+                 (set! SPILL_STACK_COUNTER 0)
                  (define sorted-blocks (filter Block-reachable (sort (hash-values (CFG-blocks cfg)) block<)))
                  (for-each (lambda ([cur-block : Block])
                              (LLVMs->ARM (Block-LLVM cur-block) cur-block (CFG-blocks cfg) cfg))
-                           sorted-blocks))
+                           sorted-blocks)
+                 (cond [REGISTER_ALLOCATION? (allocate-registers! cfg)]))
                CFGs)
-     (ARM-Program global-ARM CFGs lib-funcs)]))
+     (ARM-Program global-ARM CFGs LIB_FUNCS)]))
 
 ;; create the global instructions for ARM code
 (define (create-global-ARM [globals : (Listof Global-LLVM)] [env : Environment]) : (Listof Global-ARM)
@@ -1190,35 +1206,29 @@
 
 ;; convert a list of LLVM instructions to ARM code
 (define (LLVMs->ARM [LLVMs : (Listof LLVM-Instr)] [cur-block : Block] [blocks : Block-Table] [cfg : CFG]) : Void
-  (cond
-    [(not (empty? LLVMs))
-     (cond
-       [(Alloca-LLVM? (first LLVMs))
-        (LLVMs->ARM (move-stack-pointer! LLVMs cur-block 0 cfg) cur-block blocks cfg)]
-       [else (for-each (lambda ([LLVM : LLVM-Instr])
-                         (LLVM->ARM LLVM cur-block blocks cfg))
-                       LLVMs)])]))
+  (for-each (lambda ([LLVM : LLVM-Instr])
+              (LLVM->ARM LLVM cur-block blocks cfg))
+            LLVMs))
 
 ;; convert an LLVM instruction to ARM code
 (define (LLVM->ARM [LLVM : LLVM-Instr] [cur-block : Block] [blocks : Block-Table] [cfg : CFG]) : Void
   (cond [(not (Return-Void-LLVM? LLVM))
          (match LLVM
            [(Alloca-LLVM type target)
-            (error 'LLVM->ARM "All alloca instructions should occur at the beginning of the function.")]
-           [(Arith-LLVM operator left right target)
+            (place-local-on-stack! target cfg)]
+           [(Arith-LLVM operator left right target) 
             (if (not (equal? operator '/))
-                (add-ARM! cur-block (Arith-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))
+                (add-ARM! cur-block (Arith-ARM operator target (get-reg-operand! left cur-block cfg) (if (equal? operator '+)
+                                                                                                         (get-arm-operand! right cur-block cfg)
+                                                                                                         (get-reg-operand! right cur-block cfg))))
                 (block
-                 (set-Lib-Funcs-division! lib-funcs #t)
-                 (add-ARMs! cur-block (list (Move-ARM (Register 0) (get-arm-operand! left cur-block cfg))
-                                            (Move-ARM (Register 1) (get-arm-operand! right cur-block cfg))
-                                            (Branch-Label-ARM 'aeabi_idiv)
-                                            (Move-ARM target (Register 0))))))]
+                 (set-Lib-Funcs-division! LIB_FUNCS #t)
+                 (add-ARM! cur-block (Branch-Label-ARM '__aeabi_idiv (list (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)) (list target) '()))))]
            [(Bool-LLVM operator left right target)
-            (add-ARM! cur-block (Bool-ARM operator target (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))]
+            (add-ARM! cur-block (Bool-ARM operator target (get-reg-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg)))]
            [(Comp-LLVM operator type left right target)
-            (add-ARMs! cur-block (list (Move-ARM target 0)
-                                       (Comp-ARM (get-arm-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg))
+            (add-ARMs! cur-block (list (Comp-ARM (get-reg-operand! left cur-block cfg) (get-arm-operand! right cur-block cfg))
+                                       (Move-ARM target 0)
                                        (Move-Cond-ARM operator target 1)))]
            [(Size-LLVM operator operand from to target)
             (cond
@@ -1228,67 +1238,87 @@
            [(Get-Elm-Ptr-LLVM type pointer field-offset target)
             (add-ARM! cur-block (Arith-ARM '+ target (get-arm-operand! pointer cur-block cfg) (* field-offset 4)))]
            [(Call-LLVM func-name _ _ args target)
-            (define arg-num 0)
-            (for-each (lambda ([arg : Operand])
-                        (if (< arg-num 4)
-                            (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
-                            (place-arg-on-stack! arg arg-num cfg))
-                        (set! arg-num (+ 1 arg-num)))
-                      args)
-            (add-ARMs! cur-block (list (Branch-Label-ARM (Global-id func-name))
-                                       (Move-ARM target (Register 0))))]
+            (cond
+              [(<= (length args) 4)
+               (define reg-args (map (lambda ([arg : Operand])
+                                       (get-arm-operand! arg cur-block cfg))
+                                     args))
+               (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name) reg-args (list target) '()))]
+              [else (define reg-args (map (lambda ([arg : Operand])
+                                            (get-arm-operand! arg cur-block cfg))
+                                          (take args 4)))
+                    (define store-stack-ARMs (map (lambda ([arg : Operand] [arg-idx : Integer])
+                                                    (place-arg-on-stack arg arg-idx cur-block cfg))
+                                                  (list-tail args 4) (range 4 (length args))))
+                    (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name) reg-args (list target) store-stack-ARMs))])]
            [(Call-Void-LLVM func-name arg-types args)
-            (define arg-num 0)
-            (for-each (lambda ([arg : Operand])
-                        (if (< arg-num 4)
-                            (add-ARM! cur-block (Move-ARM (Register arg-num) (get-arm-operand! arg cur-block cfg)))
-                            (place-arg-on-stack! arg arg-num cfg))
-                        (set! arg-num (+ 1 arg-num)))
-                      args)
-            (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name)))]
+            (cond
+              [(<= (length args) 4)
+               (define reg-args (map (lambda ([arg : Operand])
+                                       (get-arm-operand! arg cur-block cfg))
+                                     args))
+               (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name) reg-args '() '()))]
+              [else (define reg-args (map (lambda ([arg : Operand])
+                                            (get-arm-operand! arg cur-block cfg))
+                                          (take args 4)))
+                    (define store-stack-ARMs (map (lambda ([arg : Operand] [arg-idx : Integer])
+                                                    (place-arg-on-stack arg arg-idx cur-block cfg))
+                                                  (list-tail args 4) (range 4 (length args))))
+                    (add-ARM! cur-block (Branch-Label-ARM (Global-id func-name) reg-args '() store-stack-ARMs))])]
            [(Malloc-LLVM target size)
-            (add-ARMs! cur-block (list (Move-Word-ARM (Register 0) size)
-                                       (Branch-Label-ARM 'malloc)
-                                       (Move-ARM target (Register 0))))]
+            (add-ARM! cur-block (Branch-Label-ARM 'malloc (list size) (list target) '()))]
            [(Free-LLVM target)
-            (add-ARMs! cur-block (list (Move-ARM (Register 0) target)
-                                       (Branch-Label-ARM 'free)))]
+            (add-ARM! cur-block (Branch-Label-ARM 'free (list target) '() '()))]
            [(Load-LLVM _ source target _)
-            (if (Local? source)
-                (add-ARM! cur-block (Load-Stack-ARM (get-arm-operand! target cur-block cfg)
-                                                    (if (hash-has-key? (CFG-stack cfg) source)
-                                                        (hash-ref (CFG-stack cfg) source)
-                                                        (error 'LLVM->ARM "Local variable ~e is used undefined" (Local-id source)))))
-                (add-ARM! cur-block (Load-Reg-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg))))]
-           [(Store-LLVM type source target indir)
-            (define source-operand (get-reg-operand source cur-block cfg))
-            (if (Local? target)
-                (add-ARM! cur-block (Store-Stack-ARM source-operand (get-stack-offset cur-block target cfg)))
-                (add-ARM! cur-block (Store-Reg-ARM source-operand (get-arm-operand! target cur-block cfg))))]
-           [(Print-LLVM operand endl target)
-            (add-ARMs! cur-block (list (Move-ARM (Register 1) (get-arm-operand! operand cur-block cfg))
-                                       (Move-Word-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
-                                       (Move-Top-Constant-ARM (Register 0) (if endl '.PRINTLN_FMT '.PRINT_FMT))
-                                       (Branch-Label-ARM 'printf)))]
-           [(Scan-LLVM target result)
-            (add-ARMs! cur-block (list (Move-Word-Constant-ARM (Register 1) '.read_scratch)
-                                       (Move-Top-Constant-ARM (Register 1) '.read_scratch)
-                                       (Move-Word-Constant-ARM (Register 0) '.READ_FMT)
-                                       (Move-Top-Constant-ARM (Register 0) '.READ_FMT)
-                                       (Branch-Label-ARM 'scanf)))
             (define target-operand (get-arm-operand! target cur-block cfg))
-            (add-ARMs! cur-block (list (Move-Word-Constant-ARM target-operand '.read_scratch)
-                                       (Move-Top-Constant-ARM target-operand '.read_scratch)
-                                       (Load-Reg-ARM target-operand target-operand)))]
+            (cond [(Local? source)
+                   (add-ARM! cur-block (Load-Stack-ARM target-operand (get-stack-offset source cfg) 'fp))]
+                  [(Global? source)
+                   (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+                   (add-ARMs! cur-block (list (Move-Word-Constant-ARM intermediate (Global-id source))
+                                              (Move-Top-Constant-ARM intermediate (Global-id source))))
+                   (add-ARM! cur-block (Load-Reg-ARM target-operand intermediate))]
+                  [else (add-ARM! cur-block (Load-Reg-ARM target-operand source))])]
+           [(Store-LLVM type source target indir)
+            (define source-operand (get-reg-operand! source cur-block cfg))
+            (cond [(Local? target)
+                   (add-ARM! cur-block (Store-Stack-ARM source-operand (get-stack-offset target cfg) 'fp))]
+                  [(Global? target)
+                   (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+                   (add-ARMs! cur-block (list (Move-Word-Constant-ARM intermediate (Global-id target))
+                                              (Move-Top-Constant-ARM intermediate (Global-id target))))
+                   (add-ARM! cur-block (Store-Reg-ARM source-operand intermediate))]
+                  [else (add-ARM! cur-block (Store-Reg-ARM source-operand target))])]
+           [(Print-LLVM operand endl target)
+            (add-ARM! cur-block (Branch-Label-ARM 'printf (list (if endl '.PRINTLN_FMT '.PRINT_FMT) (get-arm-operand! operand cur-block cfg)) '() '()))]
+           [(Scan-LLVM target result)
+            (define target-operand
+              (cond [(Global? target) (Global-id target)]
+                    [(Local? target) '.read_scratch]
+                    [else target]))
+            (add-ARM! cur-block (Branch-Label-ARM 'scanf (list '.READ_FMT target-operand) '() '()))
+            (cond [(Local? target)
+                   (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+                   (add-ARMs! cur-block (list (Move-Word-Constant-ARM intermediate 'read_scratch)
+                                              (Move-Top-Constant-ARM intermediate 'read_scratch)
+                                              (Load-Reg-ARM intermediate intermediate)
+                                              (Store-Stack-ARM intermediate (get-stack-offset target cfg) 'fp)))])]
            [(Branch-LLVM block)
-            (add-temp-moves! cur-block)
-            (add-ARM! cur-block (Branch-ARM (Block-label block)))]
-           [(Cond-Branch-LLVM cond true false)
-            (println (Block-ARM cur-block))
-            (add-temp-moves! cur-block)
-            (add-ARMs! cur-block (list (Comp-ARM (get-arm-operand! cond cur-block cfg) 1)
-                                       (Branch-Equal-ARM (Block-label true))
-                                       (Branch-ARM (Block-label false))))]
+            (add-ARMs! cur-block (append (get-temp-moves! cur-block (CFG-intermediate-counter cfg))
+                                         (list (Branch-ARM (Block-label block)))))
+            (set-Block-add-temp-moves! cur-block '())]
+           [(Cond-Branch-LLVM conditional true-block false-block)
+            (cond [(and (not (empty? (Block-add-temp-moves cur-block))) (back-edge? cur-block true-block))
+                   (add-ARMs! cur-block (append (list (Comp-ARM (get-reg-operand! conditional cur-block cfg) 1)
+                                                      (Branch-Not-Equal-ARM (Block-label false-block)))
+                                                (get-temp-moves! cur-block (CFG-intermediate-counter cfg))
+                                                (list (Branch-ARM (Block-label true-block)))))
+                   (set-Block-add-temp-moves! cur-block '())]
+                  [else (cond [(not (empty? (Block-add-temp-moves cur-block)))
+                               (propagate-temp-moves! cur-block)])
+                        (add-ARMs! cur-block (list (Comp-ARM (get-reg-operand! conditional cur-block cfg) 1)
+                                                   (Branch-Equal-ARM (Block-label true-block))
+                                                   (Branch-ARM (Block-label false-block))))])]
            [(Return-Expr-LLVM type expr)
             (add-ARM! cur-block (Move-ARM (Register 0) (get-arm-operand! expr cur-block cfg)))]
            [(Phi-LLVM _ _ values target _)
@@ -1298,113 +1328,164 @@
                         (define definition-block (if (equal? def-label (Block-label entry-block))
                                                      entry-block
                                                      (hash-ref blocks def-label)))
-                        (insert-temp-move! target (Phi-Value-operand phi-val) definition-block '() (Block-ARM definition-block)))
+                        (insert-temp-move! target (Phi-Value-operand phi-val) definition-block '() (Block-ARM definition-block) cfg))
                       values)]
            [(Move-LLVM target source)
             (add-ARM! cur-block (Move-ARM (get-arm-operand! target cur-block cfg) (get-arm-operand! source cur-block cfg)))])]))
 
-;; create the ARM move instruction to move the stack point based on the number of LLVM alloca instructions
-(define (move-stack-pointer! [LLVMs : (Listof LLVM-Instr)] [cur-block : Block] [alloc-size : Integer] [cfg : CFG]) : (Listof LLVM-Instr)
-  (cond
-    [(and (not (empty? LLVMs)) (Alloca-LLVM? (first LLVMs)))
-     (move-stack-pointer! (rest LLVMs) cur-block (+ 4 alloc-size) cfg)]
-    [else
-     (add-ARM! cur-block (Arith-ARM '- (Special-Register 'sp) (Special-Register 'sp) alloc-size))
-     (set-CFG-alloc-size! cfg alloc-size)
-     LLVMs]))
+;; propagate the temporary move instructions of a block (used to resolve phi nodes)
+;; these move instructions were only stored in the block, as opposed to added immediately, if they are related to a while loop
+;; we must place these move instructions after the conditional branch out of the loop, and before the branch back into the loop
+;; do a breadth first search to find the first back-edge and place them there
+(define (propagate-temp-moves! [cur-block : Block]) : Void
+  (define queue (map (lambda ([successor-block : Block])
+                       (Edge cur-block successor-block))
+                     (Block-successors cur-block)))
+  (prop-temp-moves! cur-block queue))
+
+;; helper function for propagating temporary move instructions (above)
+(define (prop-temp-moves! [cur-block : Block] [queue : (Listof Edge)]) : Void
+  (cond [(not (empty? queue))
+         (define edge (first queue))
+         (cond [(back-edge? (Edge-first-block edge) (Edge-next-block edge))
+                (set-Block-add-temp-moves! (Edge-first-block edge) (append (Block-add-temp-moves (Edge-first-block edge))
+                                                                           (Block-add-temp-moves cur-block)))
+                (set-Block-add-temp-moves! cur-block '())]
+               [else (define edges-to-add (map (lambda ([successor-block : Block])
+                                                 (Edge (Edge-next-block edge) successor-block))
+                                               (Block-successors (Edge-next-block edge))))
+                     (prop-temp-moves! cur-block (append (rest queue) edges-to-add))])]
+        [else (error 'prop-temp-moves! "Unsupported behavior - Unadded phi node move instructions ~e" (Block-add-temp-moves cur-block))]))
+
+;; place the given operand on the stack
+(define (place-local-on-stack! [local : Local] [cfg : CFG]) : Void
+  (define stack-offset (+ (- 8 (* -4 STACK_COUNTER))))
+  (set! STACK_COUNTER (+ 1 STACK_COUNTER))
+  (set-CFG-alloc-size! cfg (+ 4 (CFG-alloc-size cfg)))
+  (hash-set! (CFG-stack cfg) local stack-offset))
 
 ;; get the stack offset for the given local variable (or place it on the stack if it's not already there)
-(define (get-stack-offset [cur-block : Block] [local : Local] [cfg : CFG]) : Integer
+(define (get-stack-offset [local : Local] [cfg : CFG]) : Integer
   (if (hash-has-key? (CFG-stack cfg) local)
       (hash-ref (CFG-stack cfg) local)
+      (error 'get-stack-offset "Cannot get the stack offset for ~e, since it has not been placed on the stack" local)))
+
+;; get the stack offset for the given spilled register (or place it on the stack if it's not already there)
+(define (get-spill-stack-offset [operand : Operand] [cfg : CFG]) : Integer
+  (if (hash-has-key? (CFG-stack cfg) operand)
+      (hash-ref (CFG-stack cfg) operand)
       (block
-       (define stack-offset (- (CFG-alloc-size cfg) (* 4 stack-counter)))
-       (set! stack-counter (+ 1 stack-counter))
-       (hash-set! (CFG-stack cfg) local stack-offset)
+       (define stack-offset (+ (CFG-arg-alloc-size cfg) (* 4 SPILL_STACK_COUNTER)))
+       (set! SPILL_STACK_COUNTER (+ 1 SPILL_STACK_COUNTER))
+       (set-CFG-alloc-size! cfg (+ 4 (CFG-alloc-size cfg)))
+       (hash-set! (CFG-stack cfg) operand stack-offset)
        stack-offset)))
 
-;; place an argument on the stack when the number of arguments exceeds 4
-(define (place-arg-on-stack! [arg : Operand] [arg-num : Integer] [cur-block : Block] [cfg : CFG]) : Void
-  (set-CFG-alloc-size! cfg (+ 4 (CFG-alloc-size cfg)))
-  (define stack-offset (* 4 (- arg-num 4)))
-  (add-ARM! cur-block (Store-Stack-ARM (get-reg-operand arg cur-block cfg) stack-offset)))
+;; get the stack offset for a given argument number
+(define (get-arg-stack-offset [arg-num : Integer]) : Integer
+  (* 4 (- arg-num 3)))
 
-;; get the register operand (needed for stores since you cannot store an integer or boolean directly into memory)
-(define (get-reg-operand [operand : Operand] [cur-block : Block] [cfg : CFG]) : Operand
+;; place an argument on the stack when the number of arguments exceeds 4
+(define (place-arg-on-stack [arg : Operand] [arg-num : Integer] [cur-block : Block] [cfg : CFG]) : Store-Stack-ARM
+  (set-CFG-alloc-size! cfg (+ 4 (CFG-alloc-size cfg)))
+  (cond [(< (CFG-arg-alloc-size cfg) (* 4 (- arg-num 3)))
+         (set-CFG-arg-alloc-size! cfg (* 4 (- arg-num 3)))])
+  (define stack-offset (* 4 (- arg-num 4)))
+  (Store-Stack-ARM (get-reg-operand! arg cur-block cfg) stack-offset 'sp))
+
+;; get the register operand (needed since some instructions need to use registers)
+(define (get-reg-operand! [operand : Operand] [cur-block : Block] [cfg : CFG]) : Operand
   (cond
-    [(or (integer? operand) (boolean? operand))
-     (define target (get-target))
-     (add-ARM! cur-block (Move-ARM target (get-arm-operand! operand cur-block cfg)))
-     target]
+    [(or (integer? operand) (boolean? operand) (equal? operand 'null))
+     (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+     (add-ARM! cur-block (Move-ARM intermediate (get-arm-operand! operand cur-block cfg)))
+     intermediate]
     [else (get-arm-operand! operand cur-block cfg)]))
 
 ;; insert a move instruction to a temporary register to handle phi nodes from the LLVM code
 ;; since we are in SSA form, this move can happen anywhere in the definition block
 ;;    thus, put it as far toward the end of the block as possible to reduce register pressure
-(define (insert-temp-move! [temp : Operand] [value : Operand] [cur-block : Block] [prev-ARM : (Listof ARM-Instr)] [post-ARM : (Listof ARM-Instr)]) : Void
+(define (insert-temp-move! [temp : Operand] [value : Operand] [cur-block : Block] [prev-ARM : (Listof ARM-Instr)] [post-ARM : (Listof ARM-Instr)] [cfg : CFG]) : Void
   (cond [(not (empty? post-ARM))
-         (if (ARM-branch-instr? (first post-ARM))
-             (set-Block-ARM! cur-block (append prev-ARM (list (Move-ARM temp value)) post-ARM))
-             (insert-temp-move! temp value cur-block (append prev-ARM (list (first post-ARM))) (rest post-ARM)))]
+         (cond [(ARM-branch-instr? (first post-ARM))
+                (set-Block-ARM! cur-block prev-ARM)
+                (define value-operand (get-arm-operand! value cur-block cfg))
+                (set-Block-ARM! cur-block (append (Block-ARM cur-block) (list (Move-ARM temp value-operand)) post-ARM))]
+               [else (insert-temp-move! temp value cur-block (append prev-ARM (list (first post-ARM))) (rest post-ARM) cfg)])]
         [else (set-Block-add-temp-moves! cur-block (cons (Move-ARM temp value) (Block-add-temp-moves cur-block)))]))
 
 ;; add the temporary move instructions that were originally ignored until the block became filled
-(define (add-temp-moves! [cur-block : Block]) : Void
-  (add-ARMs! cur-block (Block-add-temp-moves cur-block))
-  (set-Block-add-temp-moves! cur-block '()))
+;; I was failing a test case since the source of a future move was getting overwritten with the target of a previous one - handle this by
+;;    adding temporary intermediates to store the appropriate values
+(define (get-temp-moves! [cur-block : Block] [counter : Counter]) : (Listof Move-ARM)
+  (define targets : (Listof Operand) '())
+  (define moves : (Listof Move-ARM) '())
+  (for-each (lambda ([cur-move : Move-ARM])
+              (cond [(not (member cur-move moves))
+                     (cond [(member (Move-ARM-source cur-move) targets)
+                            (define intermediate (get-intermediate counter))
+                            (set! moves (cons (Move-ARM intermediate (Move-ARM-source cur-move))
+                                              (append moves (list (Move-ARM (Move-ARM-target cur-move) intermediate)))))]
+                           [else (set! moves (append moves (list cur-move)))])])
+              (set! targets (append targets (list (Move-ARM-target cur-move)))))
+            (Block-add-temp-moves cur-block))
+  moves)
 
 ;; convert an ARM-Program to its string representation
-(define (ARM-Program->string [ARM-Prog : ARM-Program] [source-filename : String]) : String
+(define (ARM-Program->string [ARM-Prog : ARM-Program]) : String
   (match ARM-Prog
     [(ARM-Program global-decs CFGs lib-funcs)
-     (define func-counter 0)
-     (string-append "   .text\n   .file \"" source-filename "\"\n"
+     (string-append "   .arch armv7-a\n"
+                    (apply string-append (map global-ARM->string global-decs)) "\n"
+                    "   .text\n"
                     (apply string-append (map (lambda ([cfg : CFG])
-                                                (define func-idx func-counter)
-                                                (set! func-counter (+ 1 func-counter))
-                                                (ARM-CFG->string cfg func-idx))
+                                                (ARM-CFG->string cfg))
                                               CFGs))
-                    (apply string-append (map global-ARM->string global-decs))
                     (lib-funcs->string lib-funcs))]))
 
 ;; convert a CFG from ARM to its string representation
-(define (ARM-CFG->string [cfg : CFG] [func-idx : Integer]) : String
+(define (ARM-CFG->string [cfg : CFG]) : String
   (match cfg
-    [(CFG func-name _ _ blocks stack data alloc-size)
+    [(CFG func-name _ _ blocks stack alloc-size _ saved-registers _)
      (define sorted-blocks (filter Block-reachable (sort (hash-values (CFG-blocks cfg)) block<)))
-     (string-append "   .globl   " (symbol->string func-name) "\n"
-                    "   .p2align 2\n"
-                    "   .type " (symbol->string func-name) ",%function\n"
-                    "   .code 32\n"
+     (string-append "   .align 2\n"
+                    "   .global   " (symbol->string func-name) "\n"
                     (symbol->string func-name) ":\n"
-                    (if (not (equal? alloc-size 0))
-                        (string-append "   push {r11, lr}\n"
-                                       "   mov r11, sp\n"
-                                       "   sub sp, sp, " (number->string alloc-size))
+                    (string-append ".LU" (number->string (Block-label (hash-ref blocks 'entry-block))) ":\n")
+                     "   push {fp, lr}\n"
+                     "   add fp, sp, #4\n" 
+                    (if (not (empty? saved-registers))
+                        (string-append "   push {" (string-append "r" (number->string (first saved-registers)))
+                                       (apply string-append (map (lambda ([reg : Integer]) (string-append ", r" (number->string reg))) (rest saved-registers))) "}\n")
+                        "")
+                    (if (not (equal? 0 alloc-size))
+                        (string-append "   sub sp, sp, #" (number->string alloc-size) "\n")
                         "")
                     (apply string-append (map (lambda ([ARM : ARM-Instr])
-                                                (ARM->string ARM func-idx))
-                                              (Block-ARM (first sorted-blocks))))
+                                                (ARM->string ARM))
+                                              (if REGISTER_ALLOCATION?
+                                                  (Block-allocated-ARM (first sorted-blocks))
+                                                  (Block-ARM (first sorted-blocks)))))
                     (apply string-append (map (lambda ([cur-block : Block])
-                                                (string-append ".LBB" (number->string func-idx) "_" (number->string (Block-label cur-block)) ":\n"
+                                                (string-append ".LU" (number->string (Block-label cur-block)) ":\n"
                                                                (apply string-append (map (lambda ([ARM : ARM-Instr])
-                                                                                           (ARM->string ARM func-idx))
-                                                                                         (Block-ARM cur-block)))))
+                                                                                           (ARM->string ARM))
+                                                                                         (if REGISTER_ALLOCATION?
+                                                                                             (Block-allocated-ARM cur-block)
+                                                                                             (Block-ARM cur-block))))))
                                               (rest sorted-blocks)))
-                    (if (not (equal? alloc-size 0))
-                        (string-append "   mov sp, r11\n"
-                                       "   push {r11, pc}\n")
-                        "   bx lr\n")
-                    (apply string-append (map (lambda ([data-entry : (cons Global Data-Entry)])
-                                                (ARM-data->string data-entry func-idx))
-                                              (sort (hash->list data) data<)))
-                    ".Lfunc_end" (number->string func-idx) ":\n"
-                    "   .size " (symbol->string func-name) ", .Lfunc_end" (number->string func-idx) "-" (symbol->string func-name) "\n"
-                    "   .cantunwind\n"
-                    "   .fnend\n\n")]))
+                    (if (not (equal? 0 alloc-size))
+                        (string-append "   add sp, sp, #" (number->string alloc-size) "\n")
+                        "")
+                    (if (not (empty? saved-registers))
+                        (string-append "   pop {" (string-append "r" (number->string (first saved-registers)))
+                                       (apply string-append (map (lambda ([reg : Integer]) (string-append ", r" (number->string reg))) (rest saved-registers))) "}\n")
+                        "")
+                    "   pop {fp, pc}\n"
+                    "   .size " (symbol->string func-name) ", .-" (symbol->string func-name) "\n")]))
 
 ;; convert an ARM instruction to its string representation
-(define (ARM->string [ARM : ARM-Instr] [func-idx : Integer]) : String
+(define (ARM->string [ARM : ARM-Instr]) : String
   (match ARM
     [(Arith-ARM operator target left right)
      (string-append "   " (ARM-operator->string operator) " " (ARM-operand->string target) ", "
@@ -1414,8 +1495,16 @@
                     (ARM-operand->string left) ", " (ARM-operand->string right) "\n")]
     [(Move-ARM target source)
      (string-append "   mov " (ARM-operand->string target) ", " (ARM-operand->string source) "\n")]
-    [(Branch-Label-ARM label)
-     (string-append "   bl " (symbol->string label) "\n")]
+    [(Branch-Label-ARM label args targets store-stack-ARMs)
+     (string-append (apply string-append (map ARM->string store-stack-ARMs))
+                    (apply string-append (map (lambda ([arg : (U Operand Symbol)] [arg-idx : Integer])
+                                                (cond [(equal? 'null arg) (ARM->string (Move-ARM (Register arg-idx) 'null))]
+                                                      [(symbol? arg) (string-append (ARM->string (Move-Word-Constant-ARM (Register arg-idx) arg))
+                                                                                    (ARM->string (Move-Top-Constant-ARM (Register arg-idx) arg)))]
+                                                      [else (ARM->string (Move-ARM (Register arg-idx) arg))]))
+                                              (reverse args) (reverse (range 0 (length args)))))
+                    (string-append "   bl " (symbol->string label) "\n")
+                    (if (empty? targets) "" (ARM->string (Move-ARM (first targets) (Register 0)))))]
     [(Comp-ARM left right)
      (string-append "   cmp " (ARM-operand->string left) ", " (ARM-operand->string right) "\n")]
     [(Move-Cond-ARM operator target source)
@@ -1432,40 +1521,45 @@
     [(Move-Top-Constant-ARM target source)
      (string-append "   movt " (ARM-operand->string target) ", #:upper16:" (symbol->string source) "\n")]
     [(Load-Reg-ARM target source)
-     (string-append "   ldr " (ARM-operand->string target) ", [" (operand->string source) "]\n")]
-    [(Load-Data-ARM target data-idx)
-     (string-append "   ldr " (ARM-operand->string target) ", .LCPI" (number->string func-idx) "_" (number->string data-idx) "\n")]
-    [(Load-Stack-ARM target stack-offset)
-     (string-append "   ldr " (ARM-operand->string target) ", [sp, " (if (equal? stack-offset 0)
-                                                                       ""
-                                                                       (string-append ", #" (number->string stack-offset)))
+     (string-append "   ldr " (ARM-operand->string target) ", [" (ARM-operand->string source) "]\n")]
+    [(Load-Stack-ARM target stack-offset base-pointer)
+     (string-append "   ldr " (ARM-operand->string target) ", [" (symbol->string base-pointer)
+                    (if (equal? stack-offset 0)
+                        ""
+                        (string-append ", #" (number->string stack-offset)))
                     "]\n")]
     [(Store-Reg-ARM source target)
-     (string-append "   str " (ARM-operand->string source) ", [" (operand->string target) "]\n")]
-    [(Store-Stack-ARM source stack-offset)
-     (string-append "   str " (ARM-operand->string source) ", [sp" (if (equal? stack-offset 0)
-                                                                       ""
-                                                                       (string-append ", #" (number->string stack-offset)))
+     (string-append "   str " (ARM-operand->string source) ", [" (ARM-operand->string target) "]\n")]
+    [(Store-Stack-ARM source stack-offset base-pointer)
+     (string-append "   str " (ARM-operand->string source) ", [" (symbol->string base-pointer)
+                    (if (equal? stack-offset 0)
+                        ""
+                        (string-append ", #" (number->string stack-offset)))
                     "]\n")]
     [(Branch-Equal-ARM block-label)
-     (string-append "   beq " (ARM-label->string block-label func-idx) "\n")]
+     (string-append "   beq " (ARM-label->string block-label) "\n")]
+    [(Branch-Not-Equal-ARM block-label)
+     (string-append "   bne " (ARM-label->string block-label) "\n")]
     [(Branch-ARM block-label)
-     (string-append "   b " (ARM-label->string block-label func-idx) "\n")]))
-
+     (string-append "   b " (ARM-label->string block-label) "\n")]
+    [(Push-ARM registers)
+     (string-append "   push {r" (number->string (first registers)) (apply string-append (map (lambda ([reg : Integer])
+                                                                                                (string-append ", r" (number->string reg)))
+                                                                                              (rest registers)))
+                    "}\n")]
+    [(Pop-ARM registers)
+     (string-append "   pop {r" (number->string (first registers)) (apply string-append (map (lambda ([reg : Integer])
+                                                                                                (string-append ", r" (number->string reg)))
+                                                                                              (rest registers)))
+                    "}\n")]))
 
 ;; convert an ARM block label to a string
-(define (ARM-label->string [block-label : Integer] [func-idx : Integer]) : String
-  (string-append ".LBB" (number->string func-idx) "_" (number->string block-label)))
-
-;; convert an ARM data definition to a string
-(define (ARM-data->string [data : (cons Global Data-Entry)] [func-idx : Integer]) : String
-  (string-append ".LCPI" (number->string func-idx) "_" (number->string (Data-Entry-index (cdr data))) ":\n"
-                 "   .long " (symbol->string (Global-id (car data))) "\n"))
+(define (ARM-label->string [block-label : Integer]) : String
+  (string-append ".LU" (number->string block-label)))
 
 ;; convert a global ARM declaration to a string
 (define (global-ARM->string [global-dec : Global-ARM]) : String
-  (string-append "   .type " (symbol->string (Global-ARM-id global-dec)) ",%object\n"
-                 "   .comm " (symbol->string (Global-ARM-id global-dec)) "," (number->string (Global-ARM-size global-dec)) ",4\n"))
+  (string-append "   .comm " (symbol->string (Global-ARM-id global-dec)) ",4,4\n"))
 
 ;; convert ARM library functions to a string
 (define (lib-funcs->string [lib-funcs : Lib-Funcs]) : String
@@ -1474,9 +1568,6 @@
      (match c-lib-funcs
        [(C-Lib-Funcs _ _ printf-newline printf-space scanf)
         (string-append
-         (if scanf (string-append "   .type .read_scratch,%object\n"
-                                  "   .comm .read_scratch,4,4\n")
-             "")
          (if (or printf-newline printf-space scanf)
              (string-append "   .section .rodata\n"
                             (if printf-newline (string-append "   .align 2\n"
@@ -1492,6 +1583,7 @@
                                                      "   .asciz \"%ld\"\n")
                                 ""))
              "")
+         (if scanf "   .comm .read_scratch,4,4\n" "")
          (if division "   .global __aeabi_idiv\n" ""))])]))
 
 ;; convert an ARM operator to its corresponding string
@@ -1515,9 +1607,10 @@
   (match operand
     [(Local id) (error 'ARM-operand->string "Unsupported operand type in ARM code: LOCAL")]
     [(Global id) (error 'ARM-operand->string "Unsupported operand type in ARM code: GLOBAL")]
-    [(Intermediate value) (string-append "r" (number->string value))]
-    [(Block _ _ _ _ _ _ _ _ _) (error 'ARM-operand->string "Unsupported operand type in ARM code: BLOCK")]
+    [(Intermediate value) (string-append "i" (number->string value))]
+    [(Block _ _ _ _ _ _ _ _ _ _ _ _) (error 'ARM-operand->string "Unsupported operand type in ARM code: BLOCK")]
     [(Register num) (string-append "r" (number->string num))]
+    [(Parameter num) (string-append "p" (number->string num))]
     [(Special-Register name) (symbol->string name)]
     [Literal (ARM-literal->string operand)]))
 
@@ -1533,42 +1626,31 @@
 (define (get-arm-operand! [operand : Operand] [cur-block : Block] [cfg : CFG]) : Operand
   (cond
     [(Global? operand)
-     (if (hash-has-key? (CFG-data cfg) operand)
-         (Data-Entry-register (hash-ref (CFG-data cfg) operand))
-         (block
-          (define target (get-target))
-          (define data-idx (get-data-counter))
-          (add-ARM! cur-block (Load-Data-ARM target data-idx))
-          (hash-set! (CFG-data cfg) operand (Data-Entry target data-idx))
-          target))]
+     (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+     (define next-intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+     (add-ARMs! cur-block (list (Move-Word-Constant-ARM intermediate (Global-id operand))
+                                (Move-Top-Constant-ARM intermediate (Global-id operand))
+                                (Load-Reg-ARM next-intermediate intermediate)))
+     next-intermediate]
     [(Local? operand)
-     (if (hash-has-key? (CFG-stack cfg) operand)
-         (block
-          (define target (get-target))
-          (add-ARM! cur-block (Load-Stack-ARM target (hash-ref (CFG-stack cfg) operand)))
-          target)
-         (error 'get-arm-operand "Local variable ~e is used undefined." operand))]
+     (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+     (add-ARM! cur-block (Load-Stack-ARM intermediate (get-stack-offset operand cfg) 'fp))
+     intermediate]
     [(integer? operand)
      (if (<= operand 4095)
          operand
          (block
-          (define target-register (get-register))
-          (add-ARM! cur-block (Move-Word-Lower-ARM target-register operand))
-          (add-ARM! cur-block (Move-Top-ARM target-register operand))
-          target-register))]
+          (define intermediate (get-intermediate (CFG-intermediate-counter cfg)))
+          (add-ARM! cur-block (Move-Word-Lower-ARM intermediate operand))
+          (add-ARM! cur-block (Move-Top-ARM intermediate operand))
+          intermediate))]
     [else operand]))
 
-;; get the register corresponding to the current counter
-(define (get-register) : Register
-  (define register (Register counter))
-  (set! counter (+ 1 counter))
-  register)
-
-;; get the index corresponding to the next piece of data and increment the counter
-(define (get-data-counter) : Integer
-  (define data data-counter)
-  (set! data-counter (+ 1 data-counter))
-  data)
+;; get the next block index and increment the block counter
+(define (get-block-counter) : Integer
+  (define block-idx BLOCK_COUNTER)
+  (set! BLOCK_COUNTER (+ 1 BLOCK_COUNTER))
+  block-idx)
 
 ;; adds a list of ARM instructions to a block
 (define (add-ARMs! [cur-block : Block] [ARMs : (Listof ARM-Instr)]) : Void
@@ -1578,18 +1660,759 @@
 (define (add-ARM! [cur-block : Block] [ARM : ARM-Instr]) : Void
   (set-Block-ARM! cur-block (append (Block-ARM cur-block) (list ARM))))
 
-;; defines the inequality used to sort data entries in the data hash table (used to preserve data definition order)
-(define (data< [data1 : (cons Global Data-Entry)] [data2 : (cons Global Data-Entry)]) : Boolean
-  (< (Data-Entry-index (cdr data1)) (Data-Entry-index (cdr data2))))
-
 ;; is this operand a literal? 
 (define (literal? [operand : Operand]) : Boolean
   (or (integer? operand) (boolean? operand) (equal? operand 'null)))
 
 ;; is this ARM instruction a control flow instruction?
 (define (ARM-branch-instr? [instr : ARM-Instr]) : Boolean
-  (or (Branch-Equal-ARM? instr) (Branch-ARM? instr)))
+  (or (Branch-Equal-ARM? instr) (Branch-Not-Equal-ARM? instr) (Branch-ARM? instr)))
 
 ;; MILESTONE 5 FUNCTIONS
 
-(define register-allocation #t)
+;; give the option to turn off register allocation for debugging
+(define REGISTER_ALLOCATION? : Boolean #t)
+(define DEBUGGING : Boolean #f)
+
+;; use untyped racket so that I can use the heap data structure without difficulty
+(module color-graph racket
+  (require "definitions.rkt")
+  (require data/heap)
+  (provide color-graph!)
+  (provide UNCHOSEN_COLOR)
+  (provide NUM_OPEN_REGISTERS)
+
+  (define DEBUGGING #f)
+  (define UNCHOSEN_COLOR -1)
+  (define FIRST_REG_NUM 0)
+  (define LAST_REG_NUM 8)
+  (define NUM_OPEN_REGISTERS 9)
+
+  ;; color the interference graph to assign intermediates to registers
+  (define (color-graph! interference-graph cfg)
+    (define priority-queue (make-heap I-Node-degree<=))
+    (heap-add-all! priority-queue (hash-values interference-graph))
+    (define stack (build-stack priority-queue '()))
+    (color-nodes! stack interference-graph cfg)
+    (cond [DEBUGGING (displayln (CFG-func-name cfg))
+                     (for-each (lambda (node)
+                                 (displayln node))
+                               (hash-values interference-graph))]))
+
+  ;; build the stack to determine the order to color the nodes
+  (define (build-stack priority-queue stack)
+    (cond [(not (equal? (heap-count priority-queue) 0))
+           (define node (choose-node priority-queue))
+           (remove-node priority-queue node)
+           (build-stack priority-queue (cons node stack))]
+          [else stack]))
+
+  ;; color each node of the graph
+  (define (color-nodes! stack interference-graph cfg)
+    (cond [(not (empty? stack))
+           (define node (first stack))
+           (cond [(equal? (I-Node-color node) UNCHOSEN_COLOR)
+                  (color-node! node interference-graph cfg)])
+           (color-nodes! (rest stack) interference-graph cfg)]))
+
+  ;; color a single node in the interference graph
+  (define (color-node! node interference-graph cfg)
+    (define interfering-colors (set))
+    (for-each (lambda (operand)
+                (define color (I-Node-color (hash-ref interference-graph operand)))
+                (cond [(not (equal? color UNCHOSEN_COLOR))
+                       (set! interfering-colors (set-add interfering-colors color))]))
+              (set->list (I-Node-interferences node)))
+    (cond [(Parameter? (I-Node-operand node))
+           (cond [(< (Parameter-num (I-Node-operand node)) 4)
+                  (cond [(not (set-member? interfering-colors (Parameter-num (I-Node-operand node))))
+                         (set-I-Node-color! node (Parameter-num (I-Node-operand node)))]
+                        [else (set-I-Node-insert-move! node #t)
+                              (set-color! node interfering-colors FIRST_REG_NUM interference-graph cfg)])])]
+          [else (set-color! node interfering-colors FIRST_REG_NUM interference-graph cfg)]))
+
+  ;; set the color of a node to the first available color
+  (define (set-color! node interfering-colors try-color interference-graph cfg)
+    (cond [(set-member? interfering-colors try-color)
+           (define next-color (+ 1 try-color))
+           (if (<= next-color LAST_REG_NUM)
+               (set-color! node interfering-colors next-color interference-graph cfg)
+               (spill-register! node interference-graph))]
+          [else (set-I-Node-color! node try-color)
+                (define saved-registers (CFG-saved-registers cfg))
+                (cond [(and (>= try-color 4) (not (member try-color saved-registers)))
+                       (set-CFG-saved-registers! cfg (append saved-registers (list try-color)))])]))
+
+  ;; mark a register as spilled and remove all of its interferences from the graph
+  (define (spill-register! node interference-graph)
+    (set-I-Node-spilled! node #t)
+    (set-I-Node-interferences! node (set))
+    (for-each (lambda (other-node)
+                (define interferences (I-Node-interferences other-node))
+                (cond [(set-member? interferences node)
+                       (set-I-Node-interferences! other-node (set-remove interferences node))
+                       (set-I-Node-degree! other-node (- (I-Node-degree other-node) 1))]))
+              (hash-values interference-graph)))
+
+  ;; choose which node to place on the stack next
+  ;; if possible, choose an unconstrained node
+  (define (choose-node priority-queue)
+    (define least-degree-node (heap-min priority-queue))
+    (cond [(< (I-Node-degree least-degree-node) NUM_OPEN_REGISTERS)
+           least-degree-node]
+          [else (choose-constrained-node priority-queue)]))
+
+  ;; choose the node with the lowest cost/degree ratio to place on the stack since we already know a node will be spilled
+  (define (choose-constrained-node priority-queue)
+    (define lowest-ratio -1)
+    (define constrained-node (heap-min priority-queue))
+    (for-each (lambda (node)
+                (cond [(not (equal? (I-Node-degree node) 0))
+                       (define cost-degree-ratio (/ (I-Node-spill-cost node) (I-Node-degree node)))
+                       (cond [(or (< cost-degree-ratio lowest-ratio) (equal? lowest-ratio -1))
+                              (set! constrained-node node)
+                              (set! lowest-ratio cost-degree-ratio)])]))
+              (vector->list (heap->vector priority-queue)))
+    constrained-node)
+
+  ;; remove a node from the priority queue and remove its interferences from the graph
+  (define (remove-node priority-queue node)
+    (heap-remove! priority-queue node)
+    (define cur-operand (I-Node-operand node))
+    (for-each (lambda (other-node)
+                (define interferences (I-Node-interferences other-node))
+                (cond [(set-member? interferences cur-operand)
+                       ;;(set-I-Node-interferences! other-node (set-remove interferences cur-operand))
+                       (set-I-Node-degree! other-node (- (I-Node-degree other-node) 1))]))
+              (vector->list (heap->vector priority-queue))))
+
+  ;; determine the ordering of nodes in the priority queue by degree from least to greatest
+  (define (I-Node-degree<= node1 node2)
+    (<= (I-Node-degree node1) (I-Node-degree node2))))
+
+;; use the untyped 'color-graph racket module (created above) within typed racket
+(require/typed 'color-graph
+               [color-graph! (Interference-Graph CFG -> Void)]
+               [UNCHOSEN_COLOR Integer]
+               [NUM_OPEN_REGISTERS Integer])
+;; use untyped racket sets in typed racket
+(require/typed racket/set
+               [set-add (-> (Setof Operand) Operand (Setof Operand))])
+
+;; allocate registers for the ARM assembly
+(define (allocate-registers! [cfg : CFG]) : Void
+  (match cfg
+    [(CFG _ parameters _ blocks _ _ _ _ _)
+     (define sorted-blocks (filter Block-reachable (sort (hash-values blocks) block<)))
+     (for-each (lambda ([cur-block : Block])
+                 (cond [(Block-reachable cur-block)
+                        (gather-live-info! cur-block (Block-ARM cur-block))]))
+               sorted-blocks)
+     (propagate-live-info! sorted-blocks)
+     (define interference-graph (create-interference-graph sorted-blocks))
+     (color-graph! interference-graph cfg)
+     (cond [DEBUGGING (displayln "Gen:")
+                      (for-each (lambda ([cur-block : Block])
+                                  (display "Block ")
+                                  (display (Block-label cur-block))
+                                  (display "- ")
+                                  (displayln (bitset->operands (Live-Analysis-gen (Block-live cur-block)))))
+                                sorted-blocks)
+                      (displayln "Kill:")
+                      (for-each (lambda ([cur-block : Block])
+                                  (display "Block ")
+                                  (display (Block-label cur-block))
+                                  (display "- ")
+                                  (displayln (bitset->operands (Live-Analysis-kill (Block-live cur-block)))))
+                                sorted-blocks)
+                      (displayln "Out:")])
+     (define entry-block (hash-ref blocks 'entry-block))
+     (set-Block-allocated-ARM! entry-block (get-param-moves interference-graph cfg))
+     (for-each (lambda ([cur-block : Block])
+                 (cond [DEBUGGING
+                        (display "Block ")
+                        (display (Block-label cur-block))
+                        (display "- ")
+                        (displayln (bitset->operands (Live-Analysis-out (Block-live cur-block))))])
+                 (set-Block-allocated-ARM! cur-block (append (Block-allocated-ARM cur-block)
+                                                             (rewrite-with-registers! (Block-ARM cur-block) interference-graph cfg))))
+               sorted-blocks)]))
+
+;; gather the local live info for each basic block
+(define (gather-live-info! [cur-block : Block] [ARMs : (Listof ARM-Instr)]) : Void
+  (cond [(not (empty? ARMs))
+         (define ARM (first ARMs))
+         (for-each (lambda ([source : Operand])
+                     (define bit-index (operand->bit-index source))
+                     (cond [(not (bitwise-bit-set? (Bitset-bits (Live-Analysis-kill (Block-live cur-block))) bit-index))
+                            (set-live! cur-block 'gen (bitwise-ior (Bitset-bits (Live-Analysis-gen (Block-live cur-block)))
+                                                                   (arithmetic-shift 1 bit-index)))]))
+                   (relevant-coloring-operands (get-ARM-sources ARM)))
+         (for-each (lambda ([target : Operand])
+                     (define bit-index (operand->bit-index target))
+                     (set-live! cur-block 'kill (bitwise-ior (Bitset-bits (Live-Analysis-kill (Block-live cur-block)))
+                                                             (arithmetic-shift 1 bit-index))))
+                   (relevant-coloring-operands (get-ARM-targets ARM)))
+         (gather-live-info! cur-block (rest ARMs))]))
+
+;; propagate the live info between blocks
+(define (propagate-live-info! [sorted-blocks : (Listof Block)]) : Void
+  (define info-changed? : Boolean #f)
+  (for-each (lambda ([cur-block : Block])
+              (define live-out (get-live-out cur-block))
+              (cond [(not (equal? live-out (Bitset-bits (Live-Analysis-out (Block-live cur-block)))))
+                     (set-live! cur-block 'out live-out)
+                     (set! info-changed? #t)]))
+            sorted-blocks)
+  (cond [info-changed? (propagate-live-info! sorted-blocks)]))
+
+;; get the live out registers for a single block
+(define (get-live-out [cur-block : Block]) : Integer
+  (finite-union (cons 0 (map (lambda ([successor : Block])
+                               (bitwise-ior (Bitset-bits (Live-Analysis-gen (Block-live successor)))
+                                            (bitwise-and (Bitset-bits (Live-Analysis-out (Block-live successor)))
+                                                         (bitwise-not (Bitset-bits (Live-Analysis-kill (Block-live successor)))))))
+                             (filter Block-reachable (Block-successors cur-block))))))
+
+;; perform the finite union of a list of bits (integers)
+(define (finite-union [bits : (Listof Integer)]) : Integer
+  (if (empty? (rest bits))
+      (first bits)
+      (bitwise-ior (first bits) (finite-union (rest bits)))))
+
+;; get the bit index of an operand 
+(define (operand->bit-index [operand : Operand]) : Integer
+  (match operand
+    [(Register num) num]
+    [(Parameter num) (+ 4 num)]
+    [(Intermediate num) (+ 8 num)]
+    [else (error "Unsupported behavior for graph coloring - operand ~e is not of the supported types." operand)]))
+
+;; convert a bit index to the corresponding operand
+(define (bit-index->operand [bit-index : Integer]) : Operand
+  (cond
+    [(< bit-index 4)
+     (Register bit-index)]
+    [(< bit-index 8)
+     (Parameter (- bit-index 4))]
+    [else (Intermediate (- bit-index 8))]))
+
+;; convert a bitset representation to the corresponding operands 
+(define (bitset->operands [bitset : Bitset]) : (Setof Operand)
+  (define operands : (Setof Operand) (set))
+  (for-each (lambda ([bit-index : Integer])
+              (cond [(bitwise-bit-set? (Bitset-bits bitset) bit-index)
+                     (set! operands (set-add operands (bit-index->operand bit-index)))]))
+            (range (integer-length (Bitset-bits bitset))))
+  operands)
+
+;; create the interference graph by iterating through the instructions from the bottom up
+(define (create-interference-graph [sorted-blocks : (Listof Block)]) : Interference-Graph
+  (define graph (ann (make-hash '()) Interference-Graph))
+  (for-each (lambda ([cur-block : Block])
+              (define live-now (Bitset (Bitset-bits (Live-Analysis-out (Block-live cur-block)))))
+              (for-each (lambda ([instr : ARM-Instr])
+                          (create-interferences! instr graph live-now cur-block))
+                        (reverse (Block-ARM cur-block)))
+              (define live-now-registers (set->list (bitset->operands live-now)))
+              (add-interference-edges! live-now-registers live-now-registers cur-block graph))
+            sorted-blocks)
+  graph)
+
+;; create the interferences associated with a single ARM instruction
+(define (create-interferences! [ARM : ARM-Instr] [graph : Interference-Graph] [live-now : Bitset] [cur-block : Block]) : Void
+  (cond [DEBUGGING 
+         (displayln "")
+         (display "ARM Instruction:    ")
+         (displayln ARM)])
+  (define live-now-registers (set->list (bitset->operands live-now)))
+  (cond [DEBUGGING 
+         (display "Live now registers:   ")
+         (displayln live-now-registers)])
+  (define sources (relevant-coloring-operands (get-ARM-sources ARM)))
+  (cond [DEBUGGING 
+         (display "Sources:   ")
+         (displayln sources)])
+  (define targets (relevant-coloring-operands (get-ARM-targets ARM)))
+  (cond [DEBUGGING 
+         (display "Targets:   ")
+         (displayln targets)])
+  (add-interference-edges! live-now-registers targets cur-block graph)
+  (add-interference-edges! targets live-now-registers cur-block graph)
+  (cond [DEBUGGING 
+         (display "Live now:    ")
+         (displayln (set->list (bitset->operands live-now)))])
+  (clear-bits! live-now targets)
+  (cond [DEBUGGING 
+         (display "Live now after cleared bits:    ")
+         (displayln (set->list (bitset->operands live-now)))])
+  (set-bits! live-now sources)
+  (cond [DEBUGGING 
+         (display "Live now after set bits:    ")
+         (displayln (set->list (bitset->operands live-now)))])
+  (for-each (lambda ([source : Operand])
+              (cond [(not (hash-has-key? graph source))
+                     (define color (if (Register? source)
+                                       (Register-num source)
+                                       UNCHOSEN_COLOR))
+                     (hash-set! graph source (I-Node source (set) 0 color #f (Block-execution-frequency cur-block) #f))]))
+            sources)
+  (cond [(Branch-Label-ARM? ARM)
+         (for-each (lambda ([arg : Operand])
+                     (define node (hash-ref graph arg))
+                     (set-I-Node-interferences! node (set-add (set-add (set-add (set-add (I-Node-interferences node)
+                                                                                         (Register 0))
+                                                                                (Register 1))
+                                                                       (Register 2))
+                                                              (Register 3))))
+                   (relevant-coloring-operands (non-constant-args (Branch-Label-ARM-args ARM))))]))
+
+;; clear the bits in the bitset corresponding to the given operands
+(define (clear-bits! [bitset : Bitset] [operands : (Listof Operand)]) : Void
+  (for-each (lambda ([bit-index : Integer])
+              (define length (integer-length (Bitset-bits bitset)))
+              (define all-ones (- (expt 2 length) 1))
+              (define bitmask (- all-ones (arithmetic-shift 1 bit-index)))
+              (set-Bitset-bits! bitset (bitwise-and (Bitset-bits bitset) bitmask)))
+            (map (lambda ([operand : Operand])
+                   (operand->bit-index operand))
+                 operands)))
+
+;; set the bits in the bitset corresponding to the given operands
+(define (set-bits! [bitset : Bitset] [operands : (Listof Operand)]) : Void
+  (for-each (lambda ([bit-index : Integer])
+              (define bitmask (arithmetic-shift 1 bit-index))
+              (set-Bitset-bits! bitset (bitwise-ior (Bitset-bits bitset) bitmask)))
+            (map (lambda ([operand : Operand])
+                   (operand->bit-index operand))
+                 operands)))
+
+;; add interferences edges from the given from-operands to the given to-operands
+(define (add-interference-edges! [from-operands : (Listof Operand)] [to-operands : (Listof Operand)] [cur-block : Block] [graph : Interference-Graph]) : Void
+  (for-each (lambda ([source : Operand])
+              (define interferes-with (filter (lambda ([to-operand : Operand])
+                                                (not (equal? source to-operand)))
+                                              to-operands))
+              (cond [(hash-has-key? graph source)
+                     (define node (hash-ref graph source))
+                     (set-I-Node-interferences! node (set-adds (I-Node-interferences node) interferes-with))
+                     (cond [DEBUGGING 
+                            (display "Adding ")
+                            (display interferes-with)
+                            (display " as interferences to ")
+                            (display source)
+                            (display ":    ")
+                            (displayln (I-Node-interferences node))])
+                     (set-I-Node-degree! node (set-count (I-Node-interferences node)))]
+                    [else (define interferences (list->set interferes-with))
+                          (define color (if (Register? source)
+                                            (Register-num source)
+                                            UNCHOSEN_COLOR))
+                          (define node (I-Node source interferences (set-count interferences) color #f (Block-execution-frequency cur-block) #f))
+                          (hash-set! graph source node)]))
+            from-operands))
+
+;; set the bits for the current block of the corresponding type of live range analysis 
+(define (set-live! [cur-block : Block] [analysis-type : Symbol] [num : Integer]) : Void
+  (define live (Block-live cur-block))
+  (cond [(equal? analysis-type 'gen) (set-Bitset-bits! (Live-Analysis-gen live) num)]
+        [(equal? analysis-type 'kill) (set-Bitset-bits! (Live-Analysis-kill live) num)]
+        [(equal? analysis-type 'out) (set-Bitset-bits! (Live-Analysis-out live) num)]))
+
+;; rewrite each instruction by converting intermediates to their corresponding registers
+(define (rewrite-with-registers! [ARM : (Listof ARM-Instr)] [interference-graph : Interference-Graph] [cfg : CFG]) : (Listof ARM-Instr)
+  (cond [(empty? ARM) '()]
+        [else
+         (define memory-access (Memory-Access '() '()))
+         (match (first ARM)
+           [(Arith-ARM operator target left right)
+            (define new-operands (rewrite-operands (list target) (list left right) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Arith-ARM operator (first new-operands) (second new-operands) (third new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Bool-ARM operator target left right)
+            (define new-operands (rewrite-operands (list target) (list left right) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Bool-ARM operator (first new-operands) (second new-operands) (third new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-ARM target source)
+            (define new-operands (rewrite-operands (list target) (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Move-ARM (first new-operands) (second new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Branch-Label-ARM label args targets store-stack-ARMs)
+            (define new-args (map (lambda ([arg : (U Operand Symbol)])
+                                    (if (symbol? arg)
+                                        arg
+                                        (first (rewrite-operands '() (list arg) interference-graph memory-access cfg))))
+                                  args))
+            (define new-targets (rewrite-operands targets '() interference-graph memory-access cfg))
+            (define new-store-stack-ARMs (map (lambda ([store-ARM : Store-Stack-ARM])
+                                                (Store-Stack-ARM (first (rewrite-operands '() (list (Store-Stack-ARM-source store-ARM)) interference-graph memory-access cfg))
+                                                                 (Store-Stack-ARM-stack-offset store-ARM) (Store-Stack-ARM-base-pointer store-ARM)))
+                                              store-stack-ARMs))
+            (append (Memory-Access-loads memory-access)
+                    (list (Branch-Label-ARM label new-args new-targets new-store-stack-ARMs))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Comp-ARM left right)
+            (define new-operands (rewrite-operands '() (list left right) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Comp-ARM (first new-operands) (second new-operands)))
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Cond-ARM operator target source)
+            (define new-operands (rewrite-operands (list target) (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Move-Cond-ARM operator (first new-operands) (second new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Word-ARM target source)
+            (define new-operands (rewrite-operands (list target) (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Move-Word-ARM (first new-operands) (second new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Word-Lower-ARM target num)
+            (define new-operands (rewrite-operands (list target) '() interference-graph memory-access cfg))
+            (append (list (Move-Word-Lower-ARM (first new-operands) num))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Word-Constant-ARM target constant)
+            (define new-operands (rewrite-operands (list target) '() interference-graph memory-access cfg))
+            (append (list (Move-Word-Constant-ARM (first new-operands) constant))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Top-ARM target num)
+            (define new-operands (rewrite-operands (list target) '() interference-graph memory-access cfg))
+            (append (list (Move-Top-ARM (first new-operands) num))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Move-Top-Constant-ARM target constant)
+            (define new-operands (rewrite-operands (list target) '() interference-graph memory-access cfg))
+            (append (list (Move-Top-Constant-ARM (first new-operands) constant))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Load-Reg-ARM target source)
+            (define new-operands (rewrite-operands (list target) (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Load-Reg-ARM (first new-operands) (second new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Load-Stack-ARM target stack-offset base-pointer)
+            (define new-operands (rewrite-operands (list target) '() interference-graph memory-access cfg))
+            (append (list (Load-Stack-ARM (first new-operands) stack-offset base-pointer))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Store-Reg-ARM source target)
+            (define new-operands (rewrite-operands (list target) (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Store-Reg-ARM (second new-operands) (first new-operands)))
+                    (Memory-Access-stores memory-access)
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Store-Stack-ARM source stack-offset base-pointer)
+            (define new-operands (rewrite-operands '() (list source) interference-graph memory-access cfg))
+            (append (Memory-Access-loads memory-access)
+                    (list (Store-Stack-ARM (first new-operands) stack-offset base-pointer))
+                    (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Branch-Equal-ARM block-label)
+            (cons (Branch-Equal-ARM block-label)
+                  (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Branch-Not-Equal-ARM block-label)
+            (cons (Branch-Not-Equal-ARM block-label)
+                  (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Branch-ARM block-label)
+            (cons (Branch-ARM block-label)
+                  (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Push-ARM registers)
+            (cons (Push-ARM registers)
+                  (rewrite-with-registers! (rest ARM) interference-graph cfg))]
+           [(Pop-ARM registers)
+            (cons (Pop-ARM registers)
+                  (rewrite-with-registers! (rest ARM) interference-graph cfg))])]))
+
+;; rewrite a list of operands to registers based on their colors in the interference graph
+(define (rewrite-operands [targets : (Listof Operand)] [sources : (Listof Operand)] [graph : Interference-Graph] [memory-access : Memory-Access] [cfg : CFG]) : (Listof Operand)
+  (append
+   (map (lambda ([target : Operand])
+          (cond [(or (literal? target) (Register? target)) target]
+                [(and (Parameter? target) (>= (Parameter-num target) 4))
+                 (define spill-register (first-spill-register cfg))
+                 (set-Memory-Access-stores! memory-access (list (Store-Stack-ARM spill-register (get-arg-stack-offset (Parameter-num target)) 'fp)))
+                 spill-register]
+                [(hash-has-key? graph target)
+                 (define node (hash-ref graph target))
+                 (cond [(I-Node-spilled node)
+                        (define spill-register (first-spill-register cfg))
+                        (set-Memory-Access-stores! memory-access (list (Store-Stack-ARM spill-register (get-spill-stack-offset target cfg) 'sp)))
+                        spill-register]
+                       [else (Register (I-Node-color (hash-ref graph target)))])]
+                [else (error 'rewrite-operands "Unsupported behavior - target ~e not in interference-graph ~e" target graph)]))
+        targets)
+   (map (lambda ([source : Operand])
+          (define cur-loads (Memory-Access-loads memory-access))
+          (cond [(or (literal? source) (Register? source)) source]
+                [(and (Parameter? source) (>= (Parameter-num source) 4))
+                 (define spill-register (if (empty? cur-loads) (first-spill-register cfg) (second-spill-register cfg)))
+                 (set-Memory-Access-loads! memory-access (append cur-loads (list (Load-Stack-ARM spill-register (get-arg-stack-offset (Parameter-num source)) 'fp))))
+                 spill-register]
+                [(hash-has-key? graph source)
+                 (define node (hash-ref graph source))
+                 (cond [(I-Node-spilled node)
+                        (define spill-register (if (empty? cur-loads) (first-spill-register cfg) (second-spill-register cfg)))
+                        (set-Memory-Access-loads! memory-access (append cur-loads (list (Load-Stack-ARM spill-register (get-spill-stack-offset source cfg) 'sp))))
+                        spill-register]
+                       [else (Register (I-Node-color (hash-ref graph source)))])]
+                [else (error 'rewrite-operands "Unsupported behavior - source ~e not in interference-graph ~e" source graph)]))
+        sources)))
+
+;; the first designated spill register
+(define (first-spill-register [cfg : CFG]) : Operand
+  (define saved-registers (CFG-saved-registers cfg))
+  (cond [(not (member 9 saved-registers)) (set-CFG-saved-registers! cfg (append saved-registers (list 9)))])
+  (Register 9))
+
+;; the second designated spill register
+(define (second-spill-register [cfg : CFG]) : Operand
+  (define saved-registers (CFG-saved-registers cfg))
+  (cond [(not (member 10 saved-registers)) (set-CFG-saved-registers! cfg (append saved-registers (list 10)))])
+  (Register 10))
+
+;; add a list of operands to a set of operands
+(define (set-adds [set : (Setof Operand)] [to-add : (Listof Operand)]) : (Setof Operand)
+  (define new-set set)
+  (for-each (lambda ([operand : Operand])
+              (set! new-set (set-add new-set operand)))
+            to-add)
+  new-set)
+
+;; get the source operands of an ARM instruction
+(define (get-ARM-sources [ARM : ARM-Instr]) : (Listof Operand)
+  (match ARM
+    [(Arith-ARM operator target left right) (list left right)]
+    [(Bool-ARM operator target left right) (list left right)]
+    [(Move-ARM target source) (list source)]
+    [(Branch-Label-ARM label args targets store-stack-ARMs)
+     (append (non-constant-args args)
+             (map Store-Stack-ARM-source store-stack-ARMs))]
+    [(Comp-ARM left right) (list left right)]
+    [(Move-Cond-ARM operator target source) (list source)]
+    [(Move-Word-ARM target source) (list source)]
+    [(Move-Word-Lower-ARM target source) (list source)]
+    [(Move-Word-Constant-ARM target constant) '()]
+    [(Move-Top-ARM target source) (list source)]
+    [(Move-Top-Constant-ARM target constant) '()]
+    [(Load-Reg-ARM target source) (list source)]
+    [(Load-Stack-ARM target stack-offset base-pointer) '()]
+    [(Store-Reg-ARM source target) (list source target)] 
+    [(Store-Stack-ARM source stack-offset base-pointer) (list source)]
+    [(Branch-Equal-ARM block-label) '()]
+    [(Branch-Not-Equal-ARM block-label) '()]
+    [(Branch-ARM block-label) '()]
+    [(Push-ARM registers) '()]
+    [(Pop-ARM registers) '()]))
+
+;; get the target operands of an ARM instruction
+(define (get-ARM-targets [ARM : ARM-Instr]) : (Listof Operand)
+  (match ARM
+    [(Arith-ARM operator target left right) (list target)]
+    [(Bool-ARM operator target left right) (list target)]
+    [(Move-ARM target source) (list target)]
+    [(Branch-Label-ARM label args targets store-stack-ARMs)
+     (append targets (list (Register 0) (Register 1) (Register 2) (Register 3)))]
+    [(Comp-ARM left right) '()]
+    [(Move-Cond-ARM operator target source) (list target)]
+    [(Move-Word-ARM target source) (list target)]
+    [(Move-Word-Lower-ARM target source) (list target)]
+    [(Move-Word-Constant-ARM target source) (list target)]
+    [(Move-Top-ARM target source) (list target)]
+    [(Move-Top-Constant-ARM target source) (list target)]
+    [(Load-Reg-ARM target source) (list target)]
+    [(Load-Stack-ARM target stack-offset base-pointer) (list target)]
+    [(Store-Reg-ARM source target) '()]
+    [(Store-Stack-ARM source stack-offset base-pointer) '()]
+    [(Branch-Equal-ARM block-label) '()]
+    [(Branch-Not-Equal-ARM block-label) '()]
+    [(Branch-ARM block-label) '()]
+    [(Push-ARM registers) '()]
+    [(Pop-ARM registers) '()]))
+
+;; set register allocation flag
+(define (set-register-allocation! [register-allocation : String]) : Void
+  (cond
+    [(equal? register-allocation "true") (set! REGISTER_ALLOCATION? #t)]
+    [(equal? register-allocation "false") (set! REGISTER_ALLOCATION? #f)]))
+
+;; set register allocation flag
+(define (set-useless-code-elimination! [useless-code-elimination : String]) : Void
+  (cond
+    [(equal? useless-code-elimination "true") (set! USELESS_CODE_ELIMINATION? #t)]
+    [(equal? useless-code-elimination "false") (set! USELESS_CODE_ELIMINATION? #f)]))
+
+;; get the non-constant arguments to a function call
+(define (non-constant-args [args : (Listof (U Operand Symbol))]) : (Listof Operand)
+  (define non-constants : (Listof Operand) '())
+  (for-each (lambda ([arg : (U Operand Symbol)])
+              (cond [(not (symbol? arg))
+                     (set! non-constants (cons arg non-constants))]))
+            (reverse args))
+  non-constants)
+
+;; get the operands that are relevant to graph coloring
+(define (relevant-coloring-operands [operands : (Listof Operand)]) : (Listof Operand)
+  (filter (lambda ([operand : Operand])
+            (or (Intermediate? operand) (Parameter? operand) (Register? operand)))
+          operands))
+
+;; get the parameter moves to temporary registers at the beginning of each function (if necessary)
+(define (get-param-moves [graph : Interference-Graph] [cfg : CFG]) : (Listof ARM-Instr)
+  (define moves : (Listof ARM-Instr) '())
+  (for-each (lambda ([node : I-Node])
+              (define operand (I-Node-operand node))
+              (cond [(and (Parameter? operand)
+                          (I-Node-insert-move node))
+                     (if (I-Node-spilled node)
+                         (set! moves (append moves (list (Store-Stack-ARM (Register (Parameter-num operand)) (get-spill-stack-offset operand cfg) 'sp))))
+                         (set! moves (append moves (list (Move-ARM (Register (I-Node-color node)) (Register (Parameter-num operand)))))))]))
+            (hash-values graph))
+  moves)
+
+;; MILESTONE 6 FUNCTIONS
+
+(define USELESS_CODE_ELIMINATION? : Boolean #t)
+(define UNDEFINED_BLOCK -1)
+
+;; run transformation passes to eliminate useless code (SSA-based unused result algorithm)
+(define (useless-code-elimination! [blocks : Block-Table]) : Void
+  (define sorted-blocks (filter Block-reachable (sort (hash-values blocks) block<)))
+  (define use-defs (get-defs-and-uses sorted-blocks))
+  (eliminate-useless-code! blocks use-defs))
+
+;; keep iterating to remove useless code until nothing gets removed
+(define (eliminate-useless-code! [blocks : Block-Table] [use-defs : Use-Def-Table]) : Void
+  (define code-removed? : Boolean #f)
+  (for-each (lambda ([info : Use-Def-Info])
+              (cond [(not (empty? (Use-Def-Info-def-LLVM info)))
+                     (define LLVM-to-remove (first (Use-Def-Info-def-LLVM info)))
+                     (cond [(and (empty? (Use-Def-Info-use-LLVMs info)) (not (has-side-effects? LLVM-to-remove)))
+                            (define def-block (if (hash-has-key? blocks (Use-Def-Info-def-block-label info))
+                                                  (hash-ref blocks (Use-Def-Info-def-block-label info))
+                                                  (if (equal? (Block-label (hash-ref blocks 'entry-block)) (Use-Def-Info-def-block-label info))
+                                                      (hash-ref blocks 'entry-block)
+                                                      (error 'eliminate-useless-code "Unsupported behavior - block ~e not in block table"
+                                                             (Use-Def-Info-def-block-label info)))))
+                            (set-Block-LLVM! def-block (remove LLVM-to-remove (Block-LLVM def-block)))
+                            (for-each (lambda ([source : Operand])
+                                        (define source-info (hash-ref use-defs source))
+                                        (set-Use-Def-Info-use-LLVMs! source-info (remove LLVM-to-remove (Use-Def-Info-use-LLVMs source-info))))
+                                      (filter relevant-useless-code-operand (get-LLVM-sources LLVM-to-remove)))
+                            (hash-remove! use-defs (Use-Def-Info-operand info))
+                            (set! code-removed? #t)])]))
+            (hash-values use-defs))
+  (cond [code-removed? (eliminate-useless-code! blocks use-defs)]))
+
+;; does this instruction have side effects (ie. it should NOT be removed)
+(define (has-side-effects? [LLVM : LLVM-Instr]) : Boolean
+    (match LLVM
+    [(Alloca-LLVM type target) #f]
+    [(Arith-LLVM operator left right target) #f]
+    [(Bool-LLVM operator left right target) #f]
+    [(Comp-LLVM operator type left right target) #f]
+    [(Size-LLVM operator operand from to target) #f]
+    [(Get-Elm-Ptr-LLVM type pointer field-offset target) #f]
+    [(Call-LLVM func-name return-type arg-types args target) #t]
+    [(Call-Void-LLVM func-name arg-types args) #t]
+    [(Malloc-LLVM target size) #f]
+    [(Free-LLVM source) #f]
+    [(Load-LLVM type source target indir) #f]
+    [(Store-LLVM type source target indir) #t]
+    [(Print-LLVM operand endl target) #t]
+    [(Scan-LLVM var result) #t]
+    [(Branch-LLVM block) #f]
+    [(Cond-Branch-LLVM cond true false) #f]
+    [(Return-Expr-LLVM type expr) #f]
+    [(Return-Void-LLVM) #f]
+    [(Phi-LLVM _ type values target _) #f]
+    [(Move-LLVM target source) #f]))
+
+;; get the definitions and uses of all operands in a function
+(define (get-defs-and-uses [sorted-blocks : (Listof Block)]) : Use-Def-Table
+  (define use-defs (ann (make-hash '()) Use-Def-Table))
+  (for-each (lambda ([cur-block : Block])
+              (map (lambda ([LLVM : LLVM-Instr])
+                     (map (lambda ([target : Operand])
+                            (cond [(not (hash-has-key? use-defs target))
+                                   (hash-set! use-defs target (Use-Def-Info target (Block-label cur-block) (list LLVM) '()))]
+                                  [else (define info (hash-ref use-defs target))
+                                        (cond [(equal? (Use-Def-Info-def-block-label info) UNDEFINED_BLOCK)
+                                               (set-Use-Def-Info-def-block-label! info (Block-label cur-block))
+                                               (set-Use-Def-Info-def-LLVM! info (list LLVM))]
+                                              [else (error "Redefinition of target ~e not allowed in SSA form" target)])]))
+                          (filter relevant-useless-code-operand (get-LLVM-targets LLVM)))
+                     (map (lambda ([source : Operand])
+                            (cond [(hash-has-key? use-defs source)
+                                   (define use-def-info (hash-ref use-defs source))
+                                   (set-Use-Def-Info-use-LLVMs! use-def-info (cons LLVM (Use-Def-Info-use-LLVMs use-def-info)))]
+                                  [else (hash-set! use-defs source (Use-Def-Info source UNDEFINED_BLOCK '() (list LLVM)))]))
+                          (filter relevant-useless-code-operand (get-LLVM-sources LLVM))))
+                   (Block-LLVM cur-block)))
+            sorted-blocks)
+  use-defs)
+
+;; get the targets of an LLVM instruction
+(define (get-LLVM-targets [LLVM : LLVM-Instr]) : (Listof Operand)
+  (match LLVM
+    [(Alloca-LLVM type target) (list target)]
+    [(Arith-LLVM operator left right target) (list target)]
+    [(Bool-LLVM operator left right target) (list target)]
+    [(Comp-LLVM operator type left right target) (list target)]
+    [(Size-LLVM operator operand from to target) (list target)]
+    [(Get-Elm-Ptr-LLVM type pointer field-offset target) (list target)]
+    [(Call-LLVM func-name return-type arg-types args target) (list target)]
+    [(Call-Void-LLVM func-name arg-types args) '()]
+    [(Malloc-LLVM target size) (list target)]
+    [(Free-LLVM source) '()]
+    [(Load-LLVM type source target indir) (list target)]
+    [(Store-LLVM type source target indir) '()]
+    [(Print-LLVM operand endl target) '()]
+    [(Scan-LLVM var result) '()]
+    [(Branch-LLVM block) '()]
+    [(Cond-Branch-LLVM cond true false) '()]
+    [(Return-Expr-LLVM type expr) '()]
+    [(Return-Void-LLVM) '()]
+    [(Phi-LLVM _ type values target _) (list target)]
+    [(Move-LLVM target source) (list target)]))
+
+;; get the sources of an LLVM instruction
+(define (get-LLVM-sources [LLVM : LLVM-Instr]) : (Listof Operand)
+  (match LLVM
+    [(Alloca-LLVM type target) '()]
+    [(Arith-LLVM operator left right target) (list left right)]
+    [(Bool-LLVM operator left right target) (list left right)]
+    [(Comp-LLVM operator type left right target) (list left right)]
+    [(Size-LLVM operator operand from to target) (list operand)]
+    [(Get-Elm-Ptr-LLVM type pointer field-offset target) (list pointer)]
+    [(Call-LLVM func-name return-type arg-types args target) args]
+    [(Call-Void-LLVM func-name arg-types args) args]
+    [(Malloc-LLVM target size) '()]
+    [(Free-LLVM source) (list source)]
+    [(Load-LLVM type source target indir) (list source)]
+    [(Store-LLVM type source target indir) (list source target)]
+    [(Print-LLVM operand endl target) (list operand)]
+    [(Scan-LLVM var result) (list var)]
+    [(Branch-LLVM block) '()]
+    [(Cond-Branch-LLVM cond true false) (list cond)]
+    [(Return-Expr-LLVM type expr) (list expr)]
+    [(Return-Void-LLVM) '()]
+    [(Phi-LLVM _ type values target _) (map Phi-Value-operand values)]
+    [(Move-LLVM target source) (list source)]))
+
+;; these are the only operands we want to consider when doing useless code elimination
+(define (relevant-useless-code-operand [operand : Operand]) : Boolean
+  (or (Local? operand) (Intermediate? operand)))
+
+;; is this edge a back edge? I've performed block numbering such that this is apparent
+(define (back-edge? [cur-block : Block] [next-block : Block]) : Boolean
+  (>= (Block-label cur-block) (Block-label next-block)))
